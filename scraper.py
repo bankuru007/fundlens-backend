@@ -114,23 +114,27 @@ def extract_amc_name(full_amc: str) -> str:
 
 def parse_holdings(excel_bytes: bytes) -> tuple[dict, dict]:
     """
-    Parse AMFI Excel file.
+    Parse AMFI Excel file (.xls format using xlrd).
+    AMFI publishes old .xls format — must use xlrd not openpyxl.
     Returns:
         holdings: {isin: {amc: total_quantity}}
         stock_meta: {isin: {name, sector}}
     """
-    wb = openpyxl.load_workbook(io.BytesIO(excel_bytes), read_only=True)
-    ws = wb.active
+    import xlrd, re
+
+    wb = xlrd.open_workbook(file_contents=excel_bytes)
+    ws = wb.sheet_by_index(0)
 
     holdings = defaultdict(lambda: defaultdict(float))
     stock_meta = {}
     rows_parsed = 0
     rows_skipped = 0
 
-    for i, row in enumerate(ws.iter_rows(values_only=True)):
-        # Skip header
+    for i in range(ws.nrows):
         if i == 0:
-            continue
+            continue  # skip header
+
+        row = ws.row_values(i)
 
         try:
             if not row[0]:
@@ -138,19 +142,15 @@ def parse_holdings(excel_bytes: bytes) -> tuple[dict, dict]:
                 continue
 
             amc_raw = str(row[0]).strip()
-            # scheme = str(row[1]).strip() if row[1] else ''
-            isin = str(row[2]).strip() if row[2] else ''
-            company = str(row[3]).strip() if row[3] else ''
-            sector = str(row[4]).strip() if row[4] else 'Other'
-            qty_raw = row[6] if len(row) > 6 else 0
+            isin    = str(row[2]).strip() if len(row) > 2 and row[2] else ''
+            company = str(row[3]).strip() if len(row) > 3 and row[3] else ''
+            sector  = str(row[4]).strip() if len(row) > 4 and row[4] else 'Other'
+            qty_raw = row[6]              if len(row) > 6              else 0
 
-            # Validate ISIN format (INE + 10 chars)
-            import re
             if not re.match(r'^IN[A-Z0-9]{10}$', isin):
                 rows_skipped += 1
                 continue
 
-            # Parse quantity
             try:
                 qty = float(str(qty_raw).replace(',', '').strip()) if qty_raw else 0
             except (ValueError, AttributeError):
@@ -164,20 +164,17 @@ def parse_holdings(excel_bytes: bytes) -> tuple[dict, dict]:
             holdings[isin][amc] += qty
 
             if isin not in stock_meta:
-                stock_meta[isin] = {
-                    'name': company,
-                    'sector': sector or 'Other'
-                }
+                stock_meta[isin] = {'name': company, 'sector': sector or 'Other'}
             rows_parsed += 1
 
-        except Exception as e:
+        except Exception:
             rows_skipped += 1
             continue
 
-    wb.close()
     logger.info(f"Parsed {rows_parsed} rows, skipped {rows_skipped}")
     logger.info(f"Found {len(holdings)} unique stocks, {len(set(a for h in holdings.values() for a in h))} AMCs")
     return dict(holdings), stock_meta
+
 
 
 # ============================================================
