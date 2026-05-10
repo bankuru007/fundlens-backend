@@ -54,10 +54,12 @@ def get_prev_month() -> str:
 # ============================================================
 # STEP 1: DOWNLOAD AMFI EXCEL
 # ============================================================
-def download_amfi_excel(year: int, month: int) -> bytes:
-    url = get_amfi_url(year, month)
-    logger.info(f"Downloading AMFI Excel: {url}")
-
+def download_amfi_excel(year: int, month: int) -> tuple[bytes, int, int]:
+    """
+    Download AMFI Excel. If current month not published yet,
+    automatically falls back to previous month.
+    Returns (bytes, actual_year, actual_month)
+    """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -70,11 +72,33 @@ def download_amfi_excel(year: int, month: int) -> bytes:
         'Connection': 'keep-alive',
     }
 
-    req = urllib.request.Request(url, headers=headers)
-    response = urllib.request.urlopen(req, timeout=30, context=ctx)
-    data = response.read()
-    logger.info(f"Downloaded {len(data):,} bytes")
-    return data
+    # Try current month first, then fallback to previous 3 months
+    attempts = []
+    y, m = year, month
+    for _ in range(4):
+        attempts.append((y, m))
+        if m == 1:
+            m, y = 12, y - 1
+        else:
+            m -= 1
+
+    for (ay, am) in attempts:
+        url = get_amfi_url(ay, am)
+        logger.info(f"Trying AMFI Excel: {url}")
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            response = urllib.request.urlopen(req, timeout=30, context=ctx)
+            data = response.read()
+            if len(data) > 10000:  # valid file check
+                logger.info(f"✓ Downloaded {len(data):,} bytes for {ay}-{am:02d}")
+                return data, ay, am
+            else:
+                logger.warning(f"File too small ({len(data)} bytes), skipping")
+        except Exception as e:
+            logger.warning(f"Failed {ay}-{am:02d}: {e}")
+            continue
+
+    raise Exception("Could not download AMFI Excel for any recent month")
 
 
 # ============================================================
@@ -353,8 +377,11 @@ def run_scrape(year: int = None, month: int = None):
 
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    # 1. Download
-    excel_bytes = download_amfi_excel(year, month)
+    # 1. Download — auto-fallback to previous month if current not published
+    excel_bytes, actual_year, actual_month = download_amfi_excel(year, month)
+    data_month = f"{actual_year}-{actual_month:02d}"
+    prev_month = f"{actual_year}-{actual_month-1:02d}" if actual_month > 1 else f"{actual_year-1}-12"
+    logger.info(f"Using data month: {data_month}")
 
     # 2. Parse
     curr_holdings, stock_meta = parse_holdings(excel_bytes)
