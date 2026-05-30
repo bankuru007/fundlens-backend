@@ -1,12 +1,14 @@
-name: FundLens Monthly AMFI Scrape
+name: FundLens Data Source Health Check
 
+# The app fetches + caches data itself (see data_store.py / APScheduler in main.py).
+# This monthly job just verifies the upstream source (mfdata.in) still returns data.
 on:
   schedule:
     - cron: '0 5 12 * *'
   workflow_dispatch:
 
 jobs:
-  scrape:
+  health-check:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -17,11 +19,5 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
-        run: pip install requests openpyxl xlrd supabase python-dotenv
-
-      - name: Run AMFI Scraper
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      - name: Verify mfdata.in returns real holdings
         run: python scraper.py

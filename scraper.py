@@ -1,22 +1,29 @@
 """
-FundLens Scraper — Dynamic + Diagnostic
-=========================================
+FundLens Scraper — Dynamic + Diagnostic (self-contained, no database)
+=====================================================================
 Fully dynamic: auto-discovers families, auto-finds latest data month.
 Full diagnostics: tells you exactly WHY if data is 0.
+
+run_scrape() RETURNS the aggregated data (real data only, no fabrication).
+The previous month is fetched live too, so buy/sell/new/exit signals are
+computed entirely from authentic mfdata.in holdings — no DB required.
 """
 
-import os, json, time, logging, urllib.request
+import json, time, logging, urllib.request, urllib.error
 from datetime import date, datetime
 from collections import defaultdict
-from supabase import create_client, Client
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 API = "https://mfdata.in/api/v1"
-HEADERS = {'User-Agent': 'FundLens/1.0', 'Accept': 'application/json'}
+# Real browser User-Agent — generic UAs get 403'd by Cloudflare bot protection.
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
 
 # ============================================================
 # DIAGNOSTIC TRACKER
@@ -347,77 +354,11 @@ def aggregate(curr, prev, meta, dm):
     stock_rows.sort(key=lambda x: -x['total_amcs'])
     return stock_rows, amc_rows, raw_rows
 
-def save(sb, stock_rows, amc_rows, raw_rows, dm, notes):
-    B=50
-    for i in range(0,len(stock_rows),B):
-        sb.table("stock_intelligence").upsert(stock_rows[i:i+B],on_conflict="isin").execute()
-    for i in range(0,len(amc_rows),B):
-        sb.table("amc_holdings").upsert(amc_rows[i:i+B],on_conflict="isin,amc_name").execute()
-    for i in range(0,len(raw_rows),B):
-        sb.table("amc_holdings_raw").upsert(raw_rows[i:i+B],on_conflict="isin,amc_name,data_month").execute()
-    sb.table("scrape_meta").insert({
-        "scraped_at":datetime.utcnow().isoformat(),"data_month":dm,
-        "stocks_processed":len(stock_rows),
-        "amcs_scraped":len(set(r['amc_name'] for r in amc_rows)) if amc_rows else 0,
-        "notes":notes
-    }).execute()
-    logger.info(f"✓ Saved {len(stock_rows)} stocks, {len(amc_rows)} AMC records")
-
-def load_prev(sb, pm):
-    try:
-        r=sb.table("amc_holdings_raw").select("isin,amc_name,quantity").eq("data_month",pm).execute()
-        prev=defaultdict(dict)
-        for row in r.data: prev[row['isin']][row['amc_name']]=row['quantity']
-        logger.info(f"Loaded {len(r.data)} prev month records from DB ({pm})")
-        return dict(prev)
-    except Exception as e:
-        diag.warn(f"No previous month data in DB: {e}")
-        return {}
-
-# ============================================================
-# MAIN
-# ============================================================
-def run_scrape(year=None, month=None):
-    global diag
-    diag = Diagnostic()
-
-    diag.info("=== FundLens Dynamic Scraper Started ===")
-    diag.info(f"Date: {datetime.utcnow().isoformat()}")
-
-    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-    # STEP 1: Verify API
-    if not verify_api():
-        print(diag.summary())
-        save(sb, [], [], [], "unknown",
-             f"FAILED: {'; '.join(diag.errors)}")
-        return {"stocks": 0, "error": diag.errors}
-
-    # STEP 2: Find latest data month
-    dm = find_latest_month()
-    if not dm:
-        print(diag.summary())
-        save(sb, [], [], [], "unknown",
-             f"FAILED: {'; '.join(diag.errors)}")
-        return {"stocks": 0, "error": diag.errors}
-
-    pm = get_prev_month(dm)
-    diag.info(f"Data month: {dm}, Previous month: {pm}")
-
-    # STEP 3: Get equity families
-    families = get_equity_families()
-    if not families:
-        print(diag.summary())
-        save(sb, [], [], [], dm,
-             f"FAILED: {'; '.join(diag.errors)}")
-        return {"stocks": 0, "error": diag.errors}
-
-    # STEP 4: Fetch holdings
+def fetch_month(families, dm):
+    """Fetch holdings for every family for a given month. Returns (curr, meta, stats)."""
     curr = defaultdict(lambda: defaultdict(float))
     meta = {}
-    n_ok = 0
-    n_empty = 0
-    n_error = 0
+    n_ok = n_empty = n_error = 0
     sample_errors = []
 
     for i, f in enumerate(families):
@@ -437,63 +378,120 @@ def run_scrape(year=None, month=None):
                 if h['isin'] not in meta:
                     meta[h['isin']] = {'name': h['name'], 'sector': h['sector']}
 
-        if (i+1) % 20 == 0:
-            diag.info(f"Progress: {i+1}/{len(families)} families | {len(curr)} stocks so far")
+        if (i + 1) % 20 == 0:
+            diag.info(f"  [{dm}] progress {i+1}/{len(families)} | {len(curr)} stocks so far")
 
         time.sleep(0.4)
 
-    diag.info(f"Holdings fetch complete: {n_ok} with data, {n_empty} empty, {n_error} errors")
+    return curr, meta, {"ok": n_ok, "empty": n_empty, "error": n_error, "sample_errors": sample_errors}
 
-    if n_error > 0:
-        diag.warn(f"Sample errors: {'; '.join(sample_errors)}")
+# ============================================================
+# MAIN — fetches real data and RETURNS it (no database)
+# ============================================================
+def run_scrape(year=None, month=None):
+    """
+    Fetch real MF holdings from mfdata.in and return aggregated intelligence.
 
-    if len(curr) == 0:
-        diag.fail("ZERO stocks found after fetching all families")
-        diag.fail(f"Families fetched: {len(families)}")
-        diag.fail(f"Families with data: {n_ok}")
-        diag.fail(f"Families empty for {dm}: {n_empty}")
-        diag.fail(f"Families with errors: {n_error}")
+    Returns a dict:
+      {
+        "status": "ok" | "unavailable",
+        "stocks": [ ...stock_intelligence rows... ],
+        "amc_details": { isin: [ ...amc rows... ] },
+        "data_month": "YYYY-MM" | None,
+        "source": "mfdata.in",
+        "fetched_at": ISO timestamp,
+        "diagnostics": [ ...human-readable steps/errors... ],
+        "families_with_data": int,
+      }
+    No fabricated data is ever returned — on failure status is "unavailable".
+    """
+    global diag
+    diag = Diagnostic()
 
-        # Try to diagnose why
-        if n_ok == 0 and n_error == 0:
-            diag.fail(f"All families returned empty for {dm}")
-            diag.fail("This month may not have portfolio data yet in mfdata.in")
-            diag.warn("Check manually: curl https://mfdata.in/api/v1/families/87/holdings?month=" + dm)
-        elif n_error > len(families) * 0.5:
-            diag.fail("More than 50% of families returned errors — API may be rate limiting")
+    diag.info("=== FundLens Dynamic Scraper Started ===")
+    diag.info(f"Date: {datetime.utcnow().isoformat()}")
 
+    def fail(dm_val):
         print(diag.summary())
-        save(sb, [], [], [], dm, f"FAILED: {'; '.join(diag.errors[:3])}")
-        return {"stocks": 0, "month": dm, "diagnostic": diag.errors}
+        return {
+            "status": "unavailable", "stocks": [], "amc_details": {},
+            "data_month": dm_val, "source": "mfdata.in",
+            "fetched_at": datetime.utcnow().isoformat(),
+            "diagnostics": diag.errors + diag.warnings, "families_with_data": 0,
+        }
 
-    diag.ok(f"Found {len(curr)} unique stocks across {n_ok} fund families")
+    # STEP 1: Verify API
+    if not verify_api():
+        return fail(None)
 
-    # STEP 5: Load prev month
-    prev = load_prev(sb, pm)
+    # STEP 2: Find latest data month (or use explicitly requested one)
+    if year and month:
+        dm = f"{year}-{month:02d}"
+        diag.info(f"Using requested month: {dm}")
+    else:
+        dm = find_latest_month()
+    if not dm:
+        return fail(None)
+
+    pm = get_prev_month(dm)
+    diag.info(f"Data month: {dm}, Previous month: {pm}")
+
+    # STEP 3: Get equity families
+    families = get_equity_families()
+    if not families:
+        return fail(dm)
+
+    # STEP 4: Fetch current month holdings (real data)
+    diag.info(f"Fetching CURRENT month holdings ({dm})...")
+    curr_d, meta, cstats = fetch_month(families, dm)
+    diag.info(f"Current month: {cstats['ok']} with data, {cstats['empty']} empty, {cstats['error']} errors")
+    if cstats["sample_errors"]:
+        diag.warn(f"Sample errors: {'; '.join(cstats['sample_errors'])}")
+
+    if len(curr_d) == 0:
+        diag.fail(f"ZERO stocks found for {dm} after fetching {len(families)} families")
+        if cstats["ok"] == 0 and cstats["error"] == 0:
+            diag.fail(f"All families returned empty for {dm} — month may not be published yet")
+        elif cstats["error"] > len(families) * 0.5:
+            diag.fail("Over 50% of families errored — API may be rate limiting or blocking")
+        return fail(dm)
+
+    diag.ok(f"Found {len(curr_d)} unique stocks across {cstats['ok']} fund families ({dm})")
+
+    # STEP 5: Fetch previous month holdings (real data) to compute buy/sell signals
+    diag.info(f"Fetching PREVIOUS month holdings ({pm}) for signal computation...")
+    prev_d, _, pstats = fetch_month(families, pm)
+    prev = {isin: dict(amcs) for isin, amcs in prev_d.items()}
+    if len(prev) == 0:
+        diag.warn(f"No previous-month ({pm}) data — signals will treat all positions as new/held")
+    else:
+        diag.ok(f"Previous month: {len(prev)} stocks ({pm}) for comparison")
 
     # STEP 6: Aggregate
-    stock_rows, amc_rows, raw_rows = aggregate(dict(curr), prev, meta, dm)
+    stock_rows, amc_rows, _raw = aggregate(
+        {isin: dict(amcs) for isin, amcs in curr_d.items()}, prev, meta, dm
+    )
     diag.ok(f"Computed signals: {len(stock_rows)} stocks, {len(amc_rows)} AMC records")
-
-    # STEP 7: Save
-    save(sb, stock_rows, amc_rows, raw_rows, dm,
-         f"OK: {len(stock_rows)} stocks from {n_ok} families via mfdata.in/families")
-    diag.ok(f"Saved to Supabase successfully")
-
     print(diag.summary())
 
-    result = {
-        "stocks": len(stock_rows),
-        "amc_records": len(amc_rows),
-        "month": dm,
-        "families_with_data": n_ok,
-        "families_empty": n_empty,
-        "families_errors": n_error,
+    # Group amc rows by isin for fast detail lookup
+    amc_by_isin = defaultdict(list)
+    for r in amc_rows:
+        amc_by_isin[r["isin"]].append(r)
+
+    return {
+        "status": "ok",
+        "stocks": stock_rows,
+        "amc_details": dict(amc_by_isin),
+        "data_month": dm,
+        "source": "mfdata.in",
+        "fetched_at": datetime.utcnow().isoformat(),
+        "diagnostics": diag.steps + diag.warnings,
+        "families_with_data": cstats["ok"],
     }
-    logger.info(f"=== Done: {result} ===")
-    return result
 
 
 if __name__ == "__main__":
     result = run_scrape()
-    print(f"\n{'✅' if result.get('stocks',0) > 0 else '❌'} Result: {result}")
+    print(f"\n{'✅' if result.get('status') == 'ok' else '❌'} "
+          f"Result: {len(result.get('stocks', []))} stocks, month={result.get('data_month')}")

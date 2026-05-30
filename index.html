@@ -1,0 +1,578 @@
+<!DOCTYPE html><html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FundLens — Live MF Intelligence</title>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist+Mono:wght@300;400;500;600&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#080b0f;--surface:#0f1318;--surface2:#161c24;--border:#ffffff0a;--border2:#ffffff14;--accent:#3de8a0;--accent2:#f05a72;--accent3:#f9c74f;--text:#eaecf2;--muted:#5a6478;--card:#0d1117}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'Outfit',sans-serif;font-size:14px;line-height:1.6;min-height:100vh;overflow-x:hidden;-webkit-font-smoothing:antialiased}
+body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(61,232,160,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(61,232,160,.025) 1px,transparent 1px);background-size:40px 40px;pointer-events:none;z-index:0}
+nav{position:sticky;top:0;z-index:100;background:rgba(8,11,15,.92);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);padding:0 32px;display:flex;align-items:center;justify-content:space-between;height:60px}
+.logo{font-family:'Instrument Serif',serif;font-size:22px;color:var(--accent);letter-spacing:-.5px}
+.logo span{color:var(--text)}
+.nav-tag{font-size:10px;color:var(--muted);letter-spacing:3px;text-transform:uppercase;font-family:'Geist Mono',monospace}
+.nav-right{display:flex;align-items:center;gap:16px}
+.live-badge{display:flex;align-items:center;gap:6px;background:rgba(61,232,160,.08);border:1px solid rgba(61,232,160,.2);border-radius:20px;padding:4px 12px;font-size:10px;color:var(--accent);letter-spacing:1.5px;font-family:'Geist Mono',monospace}
+.live-dot{width:6px;height:6px;background:var(--accent);border-radius:50%;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.8)}}
+.nav-clock{font-size:11px;color:var(--muted);font-family:'Geist Mono',monospace;text-align:right;line-height:1.4}
+.loading-overlay{position:fixed;inset:0;background:var(--bg);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:1000;transition:opacity .5s}
+.loading-overlay.hidden{opacity:0;pointer-events:none}
+.loader-logo{font-family:'Instrument Serif',serif;font-size:48px;color:var(--accent);margin-bottom:8px}
+.loader-sub{font-size:10px;color:var(--muted);letter-spacing:4px;text-transform:uppercase;font-family:'Geist Mono',monospace;margin-bottom:32px}
+.loader-status{font-size:12px;color:var(--muted);font-family:'Geist Mono',monospace;margin-bottom:20px;min-height:20px;max-width:400px;text-align:center}
+.loader-bar{width:300px;height:2px;background:var(--surface2);border-radius:2px;overflow:hidden}
+.loader-fill{height:100%;background:var(--accent);border-radius:2px;width:0;transition:width .3s ease}
+.loader-count{font-size:11px;color:var(--muted);font-family:'Geist Mono',monospace;margin-top:12px}
+.hero{position:relative;z-index:1;padding:48px 32px 32px;max-width:1400px;margin:0 auto}
+.hero-label{font-size:10px;letter-spacing:4px;color:var(--accent);text-transform:uppercase;margin-bottom:14px;font-family:'Geist Mono',monospace}
+.hero-title{font-family:'Instrument Serif',serif;font-size:clamp(38px,5vw,66px);font-weight:400;line-height:1.05;letter-spacing:-1px;margin-bottom:12px}
+.hero-title em{font-style:italic;color:var(--accent)}
+.hero-sub{font-size:15px;color:var(--muted);max-width:520px;line-height:1.7;margin-bottom:36px;font-weight:300}
+.stat-row{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:40px}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;position:relative;overflow:hidden;transition:border-color .2s}
+.stat-card:hover{border-color:var(--border2)}
+.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
+.stat-card.green::before{background:var(--accent)}.stat-card.red::before{background:var(--accent2)}.stat-card.yellow::before{background:var(--accent3)}.stat-card.blue::before{background:#7b8cff}
+.stat-label{font-size:10px;color:var(--muted);letter-spacing:2.5px;text-transform:uppercase;margin-bottom:12px;font-family:'Geist Mono',monospace}
+.stat-value{font-family:'Outfit',sans-serif;font-size:34px;font-weight:700;line-height:1;margin-bottom:6px;letter-spacing:-1px}
+.stat-value.green{color:var(--accent)}.stat-value.red{color:var(--accent2)}.stat-value.yellow{color:var(--accent3)}.stat-value.blue{color:#7b8cff}
+.stat-meta{font-size:11px;color:var(--muted);font-family:'Geist Mono',monospace;font-weight:300}
+.main{position:relative;z-index:1;max-width:1400px;margin:0 auto;padding:0 32px 60px;display:grid;grid-template-columns:1fr 340px;gap:24px}
+.filters-bar{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;align-items:center}
+.filter-group{display:flex;background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.filter-btn{background:none;border:none;color:var(--muted);font-family:'Geist Mono',monospace;font-size:10px;padding:9px 15px;cursor:pointer;transition:all .15s;letter-spacing:1.5px;white-space:nowrap}
+.filter-btn:hover{color:var(--text);background:var(--surface2)}
+.filter-btn.active{color:var(--bg);background:var(--accent)}
+.search-box{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 14px;color:var(--text);font-family:'Outfit',sans-serif;font-size:13px;outline:none;width:200px;transition:border-color .2s}
+.search-box:focus{border-color:var(--accent)}
+.search-box::placeholder{color:var(--muted)}
+.sector-filter{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+.sector-pill{background:var(--surface);border:1px solid var(--border);border-radius:20px;padding:5px 12px;font-size:9px;color:var(--muted);cursor:pointer;letter-spacing:2px;text-transform:uppercase;transition:all .15s;font-family:'Geist Mono',monospace}
+.sector-pill:hover{color:var(--text);border-color:var(--border2)}
+.sector-pill.active{background:rgba(61,232,160,.1);border-color:rgba(61,232,160,.3);color:var(--accent)}
+.table-wrap{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
+.table-header{padding:20px 24px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.table-title{font-family:'Outfit',sans-serif;font-size:15px;font-weight:600;letter-spacing:-.2px}
+.data-count{font-size:11px;color:var(--muted);font-family:'Geist Mono',monospace}
+table{width:100%;border-collapse:collapse}
+thead th{font-size:9px;letter-spacing:2.5px;color:var(--muted);text-transform:uppercase;padding:12px 24px;text-align:left;border-bottom:1px solid var(--border);cursor:pointer;user-select:none;white-space:nowrap;font-family:'Geist Mono',monospace;font-weight:500}
+thead th:hover{color:var(--text)}
+tbody tr{border-bottom:1px solid var(--border);transition:background .15s;cursor:pointer}
+tbody tr:last-child{border-bottom:none}
+tbody tr:hover{background:var(--surface2)}
+td{padding:14px 24px;font-size:13px;vertical-align:middle}
+.stock-name{font-family:'Outfit',sans-serif;font-size:14px;font-weight:600;color:var(--text);letter-spacing:-.3px}
+.stock-sub{font-size:10px;color:var(--muted);margin-top:3px;letter-spacing:1.5px;text-transform:uppercase;font-family:'Geist Mono',monospace}
+.badge{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:4px;font-size:9px;font-weight:500;letter-spacing:1.5px;font-family:'Geist Mono',monospace}
+.badge-buy{background:rgba(61,232,160,.12);color:var(--accent);border:1px solid rgba(61,232,160,.2)}
+.badge-sell{background:rgba(240,90,114,.12);color:var(--accent2);border:1px solid rgba(240,90,114,.2)}
+.badge-new{background:rgba(249,199,79,.12);color:var(--accent3);border:1px solid rgba(249,199,79,.2)}
+.badge-exit{background:rgba(123,140,255,.12);color:#7b8cff;border:1px solid rgba(123,140,255,.2)}
+.badge-hold{background:rgba(255,255,255,.05);color:var(--muted);border:1px solid var(--border)}
+.conviction-bar{display:flex;gap:3px;align-items:center}
+.conviction-pip{width:6px;height:14px;border-radius:2px;background:var(--surface2)}
+.conviction-pip.g{background:var(--accent)}.conviction-pip.r{background:var(--accent2)}
+.num-green{color:var(--accent);font-weight:500}.num-red{color:var(--accent2);font-weight:500}
+.mini-trend{display:flex;align-items:flex-end;gap:2px;height:24px}
+.trend-bar{width:4px;border-radius:2px 2px 0 0;min-height:4px}
+.data-note{font-size:10px;color:var(--muted);padding:12px 24px;border-top:1px solid var(--border);letter-spacing:1px;font-family:'Geist Mono',monospace;font-weight:300}
+.sidebar{display:flex;flex-direction:column;gap:20px}
+.side-card{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
+.side-card-header{padding:16px 20px;border-bottom:1px solid var(--border);font-family:'Outfit',sans-serif;font-size:13px;font-weight:600;letter-spacing:-.2px;display:flex;align-items:center;justify-content:space-between}
+.side-card-header span{font-size:10px;color:var(--muted);font-family:'Geist Mono',monospace;font-weight:400}
+.insight-item{padding:14px 20px;border-bottom:1px solid var(--border);transition:background .15s;cursor:pointer}
+.insight-item:last-child{border-bottom:none}
+.insight-item:hover{background:var(--surface2)}
+.insight-stock{font-family:'Outfit',sans-serif;font-size:13px;font-weight:600;margin-bottom:4px;letter-spacing:-.2px;display:flex;align-items:center;gap:8px}
+.insight-text{font-size:12px;color:var(--muted);line-height:1.6;font-weight:300}
+.amc-chip{display:inline-block;background:rgba(61,232,160,.1);border:1px solid rgba(61,232,160,.15);color:var(--accent);font-size:9px;padding:2px 7px;border-radius:3px;letter-spacing:1.5px;margin-top:6px;font-family:'Geist Mono',monospace}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);backdrop-filter:blur(8px);z-index:200;display:flex;align-items:center;justify-content:center;opacity:0;pointer-events:none;transition:opacity .2s}
+.modal-overlay.open{opacity:1;pointer-events:all}
+.modal{background:var(--surface);border:1px solid var(--border2);border-radius:20px;width:640px;max-width:95vw;max-height:88vh;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--surface2) transparent;transform:translateY(20px);transition:transform .2s}
+.modal-overlay.open .modal{transform:translateY(0)}
+.modal-header{padding:24px 28px 20px;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;justify-content:space-between}
+.modal-stock-name{font-family:'Instrument Serif',serif;font-size:30px;font-weight:400;letter-spacing:-.5px}
+.modal-meta{font-size:10px;color:var(--muted);letter-spacing:2.5px;text-transform:uppercase;margin-top:6px;font-family:'Geist Mono',monospace}
+.modal-close{background:var(--surface2);border:1px solid var(--border);color:var(--muted);width:32px;height:32px;border-radius:8px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;transition:all .15s;font-family:'Geist Mono',monospace;flex-shrink:0}
+.modal-close:hover{color:var(--text)}
+.modal-body{padding:24px 28px}
+.modal-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px}
+.modal-stat{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px;text-align:center}
+.modal-stat-val{font-family:'Outfit',sans-serif;font-size:24px;font-weight:700;margin-bottom:6px;letter-spacing:-.5px}
+.modal-stat-label{font-size:9px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;font-family:'Geist Mono',monospace}
+.insight-box{background:rgba(61,232,160,.05);border:1px solid rgba(61,232,160,.15);border-radius:10px;padding:14px 16px;margin-bottom:20px;font-size:13px;line-height:1.75;color:rgba(234,236,242,.85);font-weight:300}
+.insight-box strong{color:var(--accent)}
+.amc-row{display:flex;align-items:center;justify-content:space-between;padding:11px 0;border-bottom:1px solid var(--border);font-size:13px}
+.amc-row:last-child{border-bottom:none}
+.group-label{margin:16px 0 8px;font-size:9px;letter-spacing:2.5px;text-transform:uppercase;font-family:'Geist Mono',monospace;font-weight:500}
+.toast{position:fixed;bottom:24px;right:24px;background:var(--surface);border:1px solid var(--border2);border-radius:10px;padding:12px 18px;font-size:12px;z-index:500;transform:translateY(80px);opacity:0;transition:all .3s;font-family:'Geist Mono',monospace;letter-spacing:.5px}
+.toast.show{transform:translateY(0);opacity:1}
+.empty-state{padding:60px 24px;text-align:center}
+.empty-state-icon{font-size:36px;margin-bottom:12px}
+.empty-state-text{font-size:13px;color:var(--muted)}
+@keyframes fadeInUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+tbody tr{opacity:0;animation:fadeInUp .3s ease forwards}
+tbody tr:nth-child(1){animation-delay:.03s}tbody tr:nth-child(2){animation-delay:.06s}
+tbody tr:nth-child(3){animation-delay:.09s}tbody tr:nth-child(4){animation-delay:.12s}
+tbody tr:nth-child(5){animation-delay:.15s}tbody tr:nth-child(6){animation-delay:.18s}
+tbody tr:nth-child(7){animation-delay:.21s}tbody tr:nth-child(8){animation-delay:.24s}
+tbody tr:nth-child(9){animation-delay:.27s}tbody tr:nth-child(10){animation-delay:.30s}
+@media(max-width:900px){.main{grid-template-columns:1fr}.stat-row{grid-template-columns:repeat(2,1fr)}.sidebar{display:none}}
+</style>
+</head>
+<body><div class="loading-overlay" id="loader">
+  <div class="loader-logo">FundLens</div>
+  <div class="loader-sub">Live AMFI Intelligence</div>
+  <div class="loader-status" id="loaderStatus">Connecting to backend...</div>
+  <div class="loader-bar"><div class="loader-fill" id="loaderFill"></div></div>
+  <div class="loader-count" id="loaderCount"></div>
+</div><nav>
+  <div>
+    <div class="logo">Fund<span>Lens</span></div>
+    <div class="nav-tag">Live AMFI Portfolio Intelligence</div>
+  </div>
+  <div class="nav-right">
+    <div class="nav-clock">
+      <div id="nextUpdate">Calculating next refresh...</div>
+      <div id="liveClock">--:--:--</div>
+    </div>
+    <div class="live-badge"><div class="live-dot"></div><span id="dataSourceBadge">LOADING...</span></div>
+  </div>
+</nav><div class="hero">
+  <div class="hero-label">◆ Smart Money Tracker</div>
+  <h1 class="hero-title">Where is <em>Smart Money</em><br>flowing this month?</h1>
+  <p class="hero-sub">Real-time tracking of 44 AMCs. See what fund managers are buying, selling and exiting — straight from AMFI monthly disclosures.</p>
+  <div class="stat-row">
+    <div class="stat-card green"><div class="stat-label">Stocks Being Bought</div><div class="stat-value green" id="statBuy">—</div><div class="stat-meta" id="statBuyMeta">Loading...</div></div>
+    <div class="stat-card red"><div class="stat-label">Stocks Being Sold</div><div class="stat-value red" id="statSell">—</div><div class="stat-meta" id="statSellMeta">Loading...</div></div>
+    <div class="stat-card yellow"><div class="stat-label">New Entries</div><div class="stat-value yellow" id="statNew">—</div><div class="stat-meta">First time AMC buys</div></div>
+    <div class="stat-card blue"><div class="stat-label">Stocks Tracked</div><div class="stat-value blue" id="statTotal">—</div><div class="stat-meta" id="statMonth">Loading...</div></div>
+  </div>
+</div><div class="main">
+  <div>
+    <div class="filters-bar">
+      <div class="filter-group">
+        <button class="filter-btn active" data-signal="all" onclick="setSignal('all',this)">ALL</button>
+        <button class="filter-btn" data-signal="buy" onclick="setSignal('buy',this)">▲ BUYING</button>
+        <button class="filter-btn" data-signal="sell" onclick="setSignal('sell',this)">▼ SELLING</button>
+        <button class="filter-btn" data-signal="new" onclick="setSignal('new',this)">★ NEW ENTRY</button>
+        <button class="filter-btn" data-signal="exit" onclick="setSignal('exit',this)">✕ EXIT</button>
+      </div>
+      <input class="search-box" type="text" placeholder="Search stock..." id="searchInput" oninput="renderTable()">
+    </div>
+    <div class="sector-filter" id="sectorFilter"><div class="sector-pill active" onclick="setSector('all',this)">All Sectors</div></div>
+    <div class="table-wrap">
+      <div class="table-header">
+        <div class="table-title">Stock Intelligence Feed</div>
+        <div class="data-count" id="dataCount">Loading...</div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th onclick="sortBy('name')">STOCK ↕</th>
+            <th>SECTOR</th>
+            <th onclick="sortBy('total_amcs')">TOTAL AMCs ↕</th>
+            <th onclick="sortBy('bought')">BOUGHT ↕</th>
+            <th onclick="sortBy('sold')">SOLD ↕</th>
+            <th>CONVICTION</th>
+            <th>SIGNAL</th>
+            <th>TREND</th>
+          </tr>
+        </thead>
+        <tbody id="tableBody"></tbody>
+      </table>
+      <div class="data-note" id="dataNote">⚡ Loading from AMFI India via FundLens backend...</div>
+    </div>
+  </div>
+  <div class="sidebar">
+    <div class="side-card"><div class="side-card-header">🔥 Highest Conviction Buys <span id="sideMonth">THIS MONTH</span></div><div id="topBuys"></div></div>
+    <div class="side-card"><div class="side-card-header">🚨 Mass Selling <span>THIS MONTH</span></div><div id="topSells"></div></div>
+    <div class="side-card"><div class="side-card-header">⭐ New Entries <span>FIRST TIME</span></div><div id="newEntries"></div></div>
+  </div>
+</div><div class="modal-overlay" id="modalOverlay" onclick="closeModalOutside(event)">
+  <div class="modal">
+    <div class="modal-header">
+      <div><div class="modal-stock-name" id="modalName">—</div><div class="modal-meta" id="modalMeta">—</div></div>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-stats" id="modalStats"></div>
+      <div class="insight-box" id="modalInsight"></div>
+      <div id="modalAMCHeader" class="group-label" style="color:var(--muted)"></div>
+      <div id="modalAMCList" style="max-height:340px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--surface2) transparent"></div>
+    </div>
+  </div>
+</div><div class="toast" id="toast"></div><script>
+// ============================================================
+// FUNDLENS — Served by + connected to the FundLens backend
+// Data: AMFI India monthly portfolio disclosures (via Supabase cache)
+// Auto-updates: 12th of every month
+//
+// 3-LAYER RESILIENT DATA SYSTEM
+// Layer 1: Same-origin backend API (/api/...) — reads Supabase cache
+// Layer 2: mfdata.in live API — if backend has no data yet
+// Layer 3: Hardcoded seed data — so the page ALWAYS renders
+// ============================================================
+
+// API_BASE is empty => same origin as the page (the backend serves this file
+// and does ALL external fetching — the browser only ever talks to this backend).
+// If you open index.html standalone, point this at your running backend URL.
+const API_BASE = (location.protocol === 'file:') ? 'http://localhost:8000' : '';
+
+let allStocks=[], currentSignal='all', currentSector='all', dataStatus='loading';
+let currentSort={key:'total_amcs',dir:-1};
+let dataMonth='', statsData={};
+
+function getMonthLabel(m){
+  if(!m)return'Latest';
+  const[y,mo]=m.split('-');
+  return['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][parseInt(mo)]+' '+y;
+}
+function getCurrentMonth(){const d=new Date();return`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`}
+function fmtQty(n){if(!n||n===0)return'—';if(n>=10000000)return(n/1000000).toFixed(1)+'Cr';if(n>=100000)return(n/100000).toFixed(1)+'L';if(n>=1000)return(n/1000).toFixed(0)+'K';return n.toString()}
+function showToast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),4000)}
+function setLoader(msg,pct,count=''){
+  document.getElementById('loaderStatus').textContent=msg;
+  document.getElementById('loaderFill').style.width=pct+'%';
+  document.getElementById('loaderCount').textContent=count;
+}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+
+// ============================================================
+// API CALLS — only ever talk to our own backend (API_BASE)
+// ============================================================
+async function apiFetch(path){
+  const r=await fetch(API_BASE+path);
+  if(!r.ok)throw new Error('HTTP '+r.status);
+  return r.json();
+}
+
+function sourceBadge(stats){
+  // Truthful provenance label — never claim live if it isn't.
+  const src=(stats.source||'').toLowerCase();
+  if(stats.status==='ok' && src.includes('mfdata')) return 'LIVE · mfdata.in';
+  if(stats.status==='ok') return 'LIVE · '+(stats.source||'AMFI');
+  return 'CONNECTING…';
+}
+
+function setData(stocks, stats){
+  allStocks=stocks||[];
+  statsData=stats||{};
+  if(stats && stats.data_month) dataMonth=stats.data_month;
+  dataStatus=(allStocks.length>0)?'ok':(stats.status||'empty');
+  document.getElementById('dataSourceBadge').textContent=sourceBadge(stats||{});
+  renderStats(); buildSectorFilter(); renderTable(); renderSidebar();
+}
+
+async function loadData(){
+  // Default month label until the backend reports the real one it fetched.
+  const today=new Date();
+  dataMonth=getCurrentMonth();
+  if(today.getDate()<15){
+    const d=new Date(today); d.setMonth(d.getMonth()-1);
+    dataMonth=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+  }
+
+  // Poll the backend a few times — the first fetch from mfdata.in runs in the
+  // background and can take a little while. NO fabricated data is ever shown.
+  const attempts=20;
+  for(let i=0;i<attempts;i++){
+    const pct=60+Math.round((i/attempts)*38);
+    setLoader('Fetching live AMFI holdings via mfdata.in…',pct, i>0?`attempt ${i+1}`:'');
+    let stats={}, sr={data:[]};
+    try{
+      [sr,stats]=await Promise.all([
+        apiFetch('/api/stocks?limit=500').catch(()=>({data:[]})),
+        apiFetch('/api/stats').catch(()=>({})),
+      ]);
+    }catch(e){ console.warn('Backend not reachable yet:',e.message); }
+
+    if(sr.data && sr.data.length>0){
+      setData(sr.data, stats);
+      showToast('✓ Live data — '+allStocks.length+' stocks ('+getMonthLabel(dataMonth)+')');
+      return;
+    }
+    if(stats.status==='unavailable'){
+      dataStatus='unavailable'; statsData=stats;
+      document.getElementById('dataSourceBadge').textContent='UNAVAILABLE';
+      renderUnavailable(stats);
+      return;
+    }
+    await new Promise(r=>setTimeout(r, 3000)); // still refreshing — wait & retry
+  }
+  // Backend still has nothing after polling — be honest, invent nothing.
+  dataStatus='pending';
+  document.getElementById('dataSourceBadge').textContent='REFRESHING…';
+  renderUnavailable({status:'pending'});
+}
+
+function renderUnavailable(stats){
+  document.getElementById('statBuy').textContent='—';
+  document.getElementById('statSell').textContent='—';
+  document.getElementById('statNew').textContent='—';
+  document.getElementById('statTotal').textContent='—';
+  document.getElementById('statBuyMeta').textContent='No live data';
+  document.getElementById('statSellMeta').textContent='No live data';
+  document.getElementById('statMonth').textContent=getMonthLabel(dataMonth);
+  const pending=stats.status==='pending';
+  const msg=pending
+    ? 'Still fetching live AMFI holdings from mfdata.in — this can take a few minutes on first run. The page will fill in automatically; you can also trigger it manually with POST /api/scrape.'
+    : 'Live data is temporarily unavailable — the upstream source (mfdata.in) did not return holdings. No reference/sample numbers are shown by design. Retry with POST /api/scrape.';
+  document.getElementById('tableBody').innerHTML=
+    `<tr><td colspan="8"><div class="empty-state"><div class="empty-state-icon">${pending?'⏳':'⚠️'}</div>`+
+    `<div class="empty-state-text">${msg}</div></div></td></tr>`;
+  ['topBuys','topSells','newEntries'].forEach(id=>{
+    document.getElementById(id).innerHTML='<div class="insight-item insight-text">'+(pending?'Loading…':'No data')+'</div>';
+  });
+  document.getElementById('dataCount').textContent=pending?'Loading…':'No data';
+}
+
+// ============================================================
+// RENDERING
+// ============================================================
+const SIGNAL_BADGE={
+  buy:'<span class="badge badge-buy">▲ BUY</span>',
+  sell:'<span class="badge badge-sell">▼ SELL</span>',
+  new:'<span class="badge badge-new">★ NEW</span>',
+  exit:'<span class="badge badge-exit">✕ EXIT</span>',
+  hold:'<span class="badge badge-hold">— HOLD</span>',
+};
+
+function isBuying(s){return s.signal==='buy'||s.signal==='new'}
+function isSelling(s){return s.signal==='sell'||s.signal==='exit'}
+
+function renderStats(){
+  const buy=statsData.buying!=null?statsData.buying:allStocks.filter(isBuying).length;
+  const sell=statsData.selling!=null?statsData.selling:allStocks.filter(isSelling).length;
+  const neu=statsData.new_entries!=null?statsData.new_entries:allStocks.filter(s=>s.signal==='new').length;
+  const total=statsData.total_stocks!=null?statsData.total_stocks:allStocks.length;
+  document.getElementById('statBuy').textContent=buy;
+  document.getElementById('statSell').textContent=sell;
+  document.getElementById('statNew').textContent=neu;
+  document.getElementById('statTotal').textContent=total;
+  const amcTxt=statsData.total_amcs?`${statsData.total_amcs} AMCs tracked`:'Across all AMCs';
+  document.getElementById('statBuyMeta').textContent=amcTxt;
+  document.getElementById('statSellMeta').textContent='Reduced or exited';
+  document.getElementById('statMonth').textContent=getMonthLabel(dataMonth);
+  document.getElementById('sideMonth').textContent=getMonthLabel(dataMonth).toUpperCase();
+}
+
+function convictionPips(s){
+  const tot=(s.bought||0)+(s.sold||0);
+  let green=tot?Math.round(((s.bought||0)/tot)*5):0;
+  green=Math.max(0,Math.min(5,green));
+  let html='<div class="conviction-bar">';
+  for(let i=0;i<5;i++) html+=`<div class="conviction-pip ${i<green?'g':(tot&&i<5?'r':'')}"></div>`;
+  html+='</div>';
+  return html;
+}
+
+function miniTrend(s){
+  const vals=[s.sold||0, s.holding||0, (s.bought||0)*0.6, s.bought||0, (s.bought||0)+(s.new_entry||0)];
+  const max=Math.max(1,...vals);
+  const col=isBuying(s)?'var(--accent)':isSelling(s)?'var(--accent2)':'var(--muted)';
+  return '<div class="mini-trend">'+vals.map(v=>`<div class="trend-bar" style="height:${Math.max(4,(v/max)*24)}px;background:${col}"></div>`).join('')+'</div>';
+}
+
+function getFiltered(){
+  const q=(document.getElementById('searchInput').value||'').toLowerCase().trim();
+  let rows=allStocks.filter(s=>{
+    if(currentSignal!=='all' && s.signal!==currentSignal) return false;
+    if(currentSector!=='all' && s.sector!==currentSector) return false;
+    if(q && !(`${s.name} ${s.isin} ${s.sector}`.toLowerCase().includes(q))) return false;
+    return true;
+  });
+  const k=currentSort.key, dir=currentSort.dir;
+  rows.sort((a,b)=>{
+    let av=a[k], bv=b[k];
+    if(k==='name'){av=(av||'').toLowerCase();bv=(bv||'').toLowerCase();return av<bv?-dir:av>bv?dir:0;}
+    return ((av||0)-(bv||0))*dir;
+  });
+  return rows;
+}
+
+function renderTable(){
+  const rows=getFiltered();
+  const tb=document.getElementById('tableBody');
+  document.getElementById('dataCount').textContent=`${rows.length} of ${allStocks.length} stocks`;
+  if(!rows.length){
+    tb.innerHTML=`<tr><td colspan="8"><div class="empty-state"><div class="empty-state-icon">🔍</div><div class="empty-state-text">No stocks match your filters</div></div></td></tr>`;
+    return;
+  }
+  tb.innerHTML=rows.map(s=>`
+    <tr onclick="openModal('${esc(s.isin)}')">
+      <td><div class="stock-name">${esc(s.name)}</div><div class="stock-sub">${esc(s.isin)}</div></td>
+      <td><span class="stock-sub">${esc(s.sector||'—')}</span></td>
+      <td style="font-weight:600">${s.total_amcs||0}</td>
+      <td class="num-green">${s.bought?'+'+s.bought:'—'}</td>
+      <td class="num-red">${s.sold?'-'+s.sold:'—'}</td>
+      <td>${convictionPips(s)}</td>
+      <td>${SIGNAL_BADGE[s.signal]||SIGNAL_BADGE.hold}</td>
+      <td>${miniTrend(s)}</td>
+    </tr>`).join('');
+}
+
+function sideItem(s, text){
+  return `<div class="insight-item" onclick="openModal('${esc(s.isin)}')">
+    <div class="insight-stock">${esc(s.name)} ${SIGNAL_BADGE[s.signal]||''}</div>
+    <div class="insight-text">${text}</div>
+    <span class="amc-chip">${s.total_amcs||0} AMCs</span>
+  </div>`;
+}
+
+function renderSidebar(){
+  const buys=allStocks.filter(s=>s.signal==='buy').sort((a,b)=>(b.bought||0)-(a.bought||0)).slice(0,5);
+  const sells=allStocks.filter(isSelling).sort((a,b)=>(b.sold||0)-(a.sold||0)).slice(0,5);
+  const news=allStocks.filter(s=>s.signal==='new').sort((a,b)=>(b.new_entry||0)-(a.new_entry||0)).slice(0,5);
+  const elB=document.getElementById('topBuys'), elS=document.getElementById('topSells'), elN=document.getElementById('newEntries');
+  elB.innerHTML=buys.length?buys.map(s=>sideItem(s,`${s.bought} AMCs increased positions, only ${s.sold||0} reduced.`)).join(''):'<div class="insight-item insight-text">No strong buying this month</div>';
+  elS.innerHTML=sells.length?sells.map(s=>sideItem(s,`${s.sold} AMCs reduced${(s.exited||0)>0?`, ${s.exited} fully exited`:''}.`)).join(''):'<div class="insight-item insight-text">No mass selling this month</div>';
+  elN.innerHTML=news.length?news.map(s=>sideItem(s,`${s.new_entry} AMCs entered for the first time.`)).join(''):'<div class="insight-item insight-text">No new entries this month</div>';
+}
+
+// ============================================================
+// MODAL
+// ============================================================
+async function openModal(isin){
+  const s=allStocks.find(x=>x.isin===isin);
+  if(!s)return;
+  document.getElementById('modalOverlay').classList.add('open');
+  document.getElementById('modalName').textContent=s.name;
+  document.getElementById('modalMeta').textContent=`${s.sector||'—'} · ${s.isin} · ${getMonthLabel(dataMonth)}`;
+  document.getElementById('modalStats').innerHTML=`
+    <div class="modal-stat"><div class="modal-stat-val" style="color:var(--text)">${s.total_amcs||0}</div><div class="modal-stat-label">Total Holding</div></div>
+    <div class="modal-stat"><div class="modal-stat-val" style="color:var(--accent)">+${s.bought||0}</div><div class="modal-stat-label">Increased</div></div>
+    <div class="modal-stat"><div class="modal-stat-val" style="color:var(--muted)">${s.holding||0}</div><div class="modal-stat-label">Unchanged</div></div>
+    <div class="modal-stat"><div class="modal-stat-val" style="color:var(--accent2)">-${s.sold||0}</div><div class="modal-stat-label">Reduced</div></div>`;
+
+  let insight='';
+  if(s.signal==='new')insight=`<strong>${s.new_entry||0} AMC${(s.new_entry||0)>1?'s':''} entered ${esc(s.name)} for the first time.</strong> Simultaneous new entries signal re-rating potential. Total institutional coverage: ${s.total_amcs||0} AMCs.`;
+  else if(s.signal==='buy'){const p=Math.round(((s.bought||0)/(s.total_amcs||1))*100);insight=`<strong>${p}% of AMCs holding ${esc(s.name)} increased positions</strong> (${s.bought||0} of ${s.total_amcs||0}). Only ${s.sold||0} reduced. Broad institutional accumulation.`;}
+  else if(s.signal==='sell')insight=`<strong>${s.sold||0} AMCs reduced position in ${esc(s.name)}</strong>${(s.exited||0)>0?`, ${s.exited} fully exited`:''} this month. ${s.holding||0} still holding.`;
+  else if(s.signal==='exit')insight=`<strong>Warning: ${s.exited||0} AMC${(s.exited||0)>1?'s':''} fully exited ${esc(s.name)}.</strong> Full exits signal fundamentally changed conviction.`;
+  else insight=`${esc(s.name)}: ${s.bought||0} buying, ${s.sold||0} selling, ${s.holding||0} unchanged across ${s.total_amcs||0} AMCs. No strong directional signal.`;
+  document.getElementById('modalInsight').innerHTML=insight;
+
+  document.getElementById('modalAMCHeader').textContent='Loading AMC breakdown...';
+  document.getElementById('modalAMCList').innerHTML='<div style="padding:20px;font-size:12px;color:var(--muted)">Fetching AMC details...</div>';
+
+  // Use embedded amc_details if present, else fetch from backend
+  let amcData=s.amc_details||[];
+  if(!amcData.length){
+    try{
+      const detail=await apiFetch(`/api/stocks/${encodeURIComponent(isin)}`);
+      amcData=detail.amc_details||[];
+    }catch(e){ /* fall through to empty */ }
+  }
+
+  const am={new_entry:'<span class="badge badge-new">★ NEW</span>',buy:'<span class="badge badge-buy">▲ BUY</span>',hold:'<span class="badge badge-hold">— HOLD</span>',sell:'<span class="badge badge-sell">▼ SELL</span>',exit:'<span class="badge badge-exit">✕ EXIT</span>'};
+  const groups=[
+    {label:'New Entries',actions:['new_entry'],color:'var(--accent3)'},
+    {label:'Increased Position',actions:['buy'],color:'var(--accent)'},
+    {label:'Unchanged',actions:['hold'],color:'var(--muted)'},
+    {label:'Reduced Position',actions:['sell'],color:'var(--accent2)'},
+    {label:'Full Exits',actions:['exit'],color:'var(--accent2)'},
+  ];
+  document.getElementById('modalAMCHeader').textContent=`AMC Activity — ${amcData.length} fund houses`;
+  let html='';
+  for(const g of groups){
+    const grows=amcData.filter(a=>g.actions.includes(a.action));
+    if(!grows.length)continue;
+    html+=`<div class="group-label" style="color:${g.color}">${g.label} (${grows.length})</div>`;
+    html+=grows.map(a=>`
+      <div class="amc-row">
+        <span style="font-weight:500">${esc(a.amc_name)}</span>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:10px;color:var(--muted);font-family:'Geist Mono',monospace">
+            ${a.action!=='new_entry'&&a.action!=='exit'?(a.change_pct>0?'+':'')+a.change_pct+'%  '+fmtQty(a.curr_qty):a.action==='new_entry'?fmtQty(a.curr_qty):'was '+fmtQty(a.prev_qty)}
+          </span>
+          ${am[a.action]||''}
+        </div>
+      </div>`).join('');
+  }
+  document.getElementById('modalAMCList').innerHTML=html||'<div style="padding:20px;font-size:12px;color:var(--muted)">No AMC breakdown available yet — trigger a scrape on the backend</div>';
+}
+
+function closeModalOutside(e){if(e.target===document.getElementById('modalOverlay'))closeModal()}
+function closeModal(){document.getElementById('modalOverlay').classList.remove('open')}
+function setSignal(sig,el){currentSignal=sig;document.querySelectorAll('[data-signal]').forEach(b=>b.classList.remove('active'));el.classList.add('active');renderTable()}
+function setSector(sec,el){currentSector=sec;document.querySelectorAll('.sector-pill').forEach(p=>p.classList.remove('active'));el.classList.add('active');renderTable()}
+function sortBy(key){if(currentSort.key===key)currentSort.dir*=-1;else{currentSort.key=key;currentSort.dir=-1}renderTable()}
+
+function buildSectorFilter(){
+  const sectors=new Set(allStocks.map(s=>s.sector).filter(Boolean));
+  const c=document.getElementById('sectorFilter');
+  c.innerHTML=`<div class="sector-pill ${currentSector==='all'?'active':''}" onclick="setSector('all',this)">All Sectors</div>`+
+    [...sectors].sort().map(s=>`<div class="sector-pill ${currentSector===s?'active':''}" onclick="setSector('${esc(s)}',this)">${esc(s)}</div>`).join('');
+}
+
+function startClock(){
+  setInterval(()=>{
+    const el=document.getElementById('liveClock');
+    if(el)el.textContent=new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  },1000);
+}
+
+function startCountdown(){
+  const tick=()=>{
+    const now=new Date();
+    const next=new Date(now.getFullYear(),now.getMonth()+1,12,9,0,0);
+    const diff=next-now;
+    const d=Math.floor(diff/86400000);
+    const h=Math.floor((diff%86400000)/3600000);
+    const el=document.getElementById('nextUpdate');
+    if(el)el.textContent=`Next AMFI data in ${d}d ${h}h`;
+  };
+  tick();setInterval(tick,60000);
+}
+
+function updateNote(){
+  const note=document.getElementById('dataNote');
+  if(!note)return;
+  if(dataStatus==='ok'){
+    note.textContent=`⚡ Live data from AMFI India via ${statsData.source||'mfdata.in'} · ${getMonthLabel(dataMonth)} · ${allStocks.length} stocks · Auto-updates 12th of every month`;
+  } else if(dataStatus==='unavailable'){
+    note.textContent=`⚠️ Live data unavailable — upstream source returned nothing. No sample data shown. Retry: POST /api/scrape`;
+  } else {
+    note.textContent=`⏳ Fetching live AMFI holdings via mfdata.in… first run can take a few minutes. Auto-fills when ready.`;
+  }
+}
+
+// Keep polling quietly in the background until real data arrives.
+function backgroundPoll(){
+  if(dataStatus==='ok')return;
+  const timer=setInterval(async()=>{
+    try{
+      const[sr,stats]=await Promise.all([
+        apiFetch('/api/stocks?limit=500').catch(()=>({data:[]})),
+        apiFetch('/api/stats').catch(()=>({})),
+      ]);
+      if(sr.data && sr.data.length>0){
+        setData(sr.data, stats); updateNote();
+        showToast('✓ Live data — '+allStocks.length+' stocks ('+getMonthLabel(dataMonth)+')');
+        clearInterval(timer);
+      } else if(stats.status==='unavailable'){
+        dataStatus='unavailable'; statsData=stats;
+        document.getElementById('dataSourceBadge').textContent='UNAVAILABLE';
+        renderUnavailable(stats); updateNote();
+        clearInterval(timer);
+      }
+    }catch(e){ /* keep trying */ }
+  },8000);
+}
+
+async function init(){
+  startClock();
+  await loadData();
+  document.getElementById('loader').classList.add('hidden');
+  startCountdown();
+  updateNote();
+  if(dataStatus!=='ok' && dataStatus!=='unavailable') backgroundPoll();
+}
+
+init();
+</script></body>
+</html>
