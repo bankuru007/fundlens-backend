@@ -68,6 +68,13 @@ def health():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
 
+@app.get("/api/debug/source")
+def debug_source(family_id: int = 87, month: str = None):
+    """Show exactly what mfdata.in returns + how our parser reads it. Diagnostics only."""
+    import scraper
+    return scraper.debug_probe(family_id, month)
+
+
 # ============================================================
 # Data endpoints (read from the in-memory store)
 # ============================================================

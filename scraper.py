@@ -108,6 +108,49 @@ def api_get(path, retries=3):
             time.sleep(2 ** attempt)
     return [], "Max retries exceeded"
 
+def raw_get(path):
+    """Return the raw decoded JSON for a path (for debugging the live source)."""
+    url = API + path
+    try:
+        req = urllib.request.Request(url, headers=HEADERS)
+        r = urllib.request.urlopen(req, timeout=20)
+        return {"ok": True, "http": r.status, "json": json.loads(r.read())}
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "ignore")[:500]
+        except Exception:
+            pass
+        return {"ok": False, "http": e.code, "reason": e.reason, "body": body}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+def debug_probe(family_id=87, month=None):
+    """
+    Hit the live source and report exactly what comes back, plus how our parser
+    interprets it. Lets us confirm field names against reality from any network.
+    """
+    fam = raw_get("/families?limit=2")
+    mpath = f"/families/{family_id}/holdings" + (f"?month={month}" if month else "")
+    hold = raw_get(mpath)
+    parsed = []
+    if hold.get("ok"):
+        data = hold["json"].get("data", hold["json"]) if isinstance(hold["json"], dict) else hold["json"]
+        items = _extract_holdings(data)
+        for h in items[:3]:
+            if isinstance(h, dict):
+                parsed.append({"keys": list(h.keys()), "name_seen":
+                               (h.get('stock_name') or h.get('name') or h.get('company')),
+                               "amount_seen": _holding_amount(h)})
+    return {
+        "api_base": API,
+        "families_endpoint": fam,
+        "holdings_endpoint": {"path": mpath, **hold},
+        "parser_sees": {"holdings_count": len(_extract_holdings(
+            (hold.get("json", {}).get("data", hold.get("json", {})) if hold.get("ok") else {})
+        )), "first_items": parsed},
+    }
+
 # ============================================================
 # STEP 1: VERIFY API IS REACHABLE
 # ============================================================
@@ -152,10 +195,12 @@ def find_latest_month():
 
         if err:
             diag.warn(f"  {month_str}: error — {err}")
+            time.sleep(0.3)
             continue
 
-        if data and len(data) > 0:
-            diag.ok(f"Latest available month: {month_str} ({len(data)} holdings in probe fund)")
+        holdings = _extract_holdings(data)
+        if holdings:
+            diag.ok(f"Latest available month: {month_str} ({len(holdings)} holdings in probe fund)")
             return month_str
 
         diag.info(f"  {month_str}: no data")
@@ -274,30 +319,65 @@ def extract_amc(family_name, amc_field=''):
     parts = family_name.split()
     return ' '.join(parts[:2]) + ' MF' if len(parts) >= 2 else family_name
 
+def _to_float(v):
+    try:
+        return float(str(v).replace(',', '').replace('%', '').strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+def _extract_holdings(data):
+    """Pull the equity-holdings list out of whatever envelope the API used."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ('equity_holdings', 'equity', 'holdings', 'stocks', 'data', 'portfolio'):
+            v = data.get(key)
+            if isinstance(v, list):
+                return v
+        # data might itself be a dict keyed by isin -> holding
+        vals = list(data.values())
+        if vals and all(isinstance(x, dict) for x in vals):
+            return vals
+    return []
+
+def _holding_amount(h):
+    """Position size: prefer real quantity/value, fall back to weight/allocation %."""
+    for k in ('quantity', 'units', 'shares', 'market_value', 'value', 'amount',
+              'weight_pct', 'weightage', 'weight', 'percentage', 'percent',
+              'allocation', 'corpus_pct', 'holding_pct', 'pct'):
+        amt = _to_float(h.get(k))
+        if amt > 0:
+            return amt
+    return 0.0
+
 def fetch_family_holdings(fid, fname, amc, data_month):
     data, err = api_get(f"/families/{fid}/holdings?month={data_month}")
-
     if err:
-        return [], err
+        # Retry without the month param — some deployments only serve "latest"
+        data, err = api_get(f"/families/{fid}/holdings")
+        if err:
+            return [], err
 
-    if isinstance(data, dict):
-        data = data.get('holdings', data.get('stocks', []))
+    holdings = _extract_holdings(data)
 
     results = []
-    for h in (data or []):
-        isin = (h.get('isin') or h.get('stock_isin') or '').strip()
-        name = (h.get('stock_name') or h.get('name') or h.get('company') or '').strip()
-        sector = (h.get('sector') or h.get('industry') or 'Other').strip()
-        qty = float(h.get('quantity') or h.get('units') or h.get('shares') or 0)
-        val = float(h.get('market_value') or h.get('value') or 0)
+    for h in holdings:
+        if not isinstance(h, dict):
+            continue
+        isin = (h.get('isin') or h.get('stock_isin') or h.get('instrument_isin') or '').strip()
+        name = (h.get('stock_name') or h.get('name') or h.get('company')
+                or h.get('instrument_name') or h.get('security') or '').strip()
+        sector = (h.get('sector') or h.get('industry') or h.get('sector_name') or 'Other')
+        sector = (sector or 'Other').strip()
+        amt = _holding_amount(h)
 
-        if name and (qty > 0 or val > 0):
+        if name and amt > 0:
             results.append({
                 'isin': isin or name,
                 'name': name,
                 'sector': sector or 'Other',
                 'amc': amc,
-                'quantity': qty if qty > 0 else val,
+                'quantity': amt,
             })
 
     return results, None
@@ -334,13 +414,16 @@ def aggregate(curr, prev, meta, dm):
             elif cq<pq*0.98:     action='sell'; sold+=1
             else:                action='hold'; holding+=1
             chg=round(((cq-pq)/pq*100),1) if pq>0 else (100.0 if cq>0 else 0.0)
+            # Keep values as-is (rounded) — they may be share counts OR allocation %,
+            # so int() truncation would wrongly zero-out sub-1% weights.
+            cqr=round(cq,4); pqr=round(pq,4)
             if cq>0 or pq>0:
                 details.append({'isin':isin,'amc_name':amc,'action':action,
-                    'curr_qty':int(cq),'prev_qty':int(pq),'change_pct':chg,'data_month':dm})
+                    'curr_qty':cqr,'prev_qty':pqr,'change_pct':chg,'data_month':dm})
             if cq>0:
                 raw_rows.append({'isin':isin,'company':meta.get(isin,{}).get('name',isin),
                     'sector':meta.get(isin,{}).get('sector','Other'),
-                    'amc_name':amc,'quantity':int(cq),'data_month':dm})
+                    'amc_name':amc,'quantity':cqr,'data_month':dm})
         order={'new_entry':0,'buy':1,'hold':2,'sell':3,'exit':4}
         details.sort(key=lambda x: order[x['action']])
         total=len([a for a in details if a['action']!='exit'])
