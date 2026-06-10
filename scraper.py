@@ -26,9 +26,17 @@ import requests
 log = logging.getLogger("fundlens.scraper")
 
 BASE = "https://finapi.upvaly.com"
-SEED_CODES = ["120503", "152135"]
-MAX_SCHEMES = int(os.environ.get("FUNDLENS_MAX_SCHEMES", "600"))
-SLEEP = float(os.environ.get("FUNDLENS_SLEEP", "0.25"))
+# One flagship equity scheme code per AMC. The crawl expands each via
+# morefundsfromamc to reach that AMC's whole lineup -> all 44 AMCs covered.
+SEED_CODES = [
+    "120503","119551","120586","125354","112090","118989","103504","120716",
+    "119019","118533","118825","102885","118424","127042","118269","118454",
+    "120178","118542","120843","100119","122639","147946","135781","119723",
+    "119226","135800","135360","118973","152135","149516","148618","148747",
+    "152460","151982","150384","148956","119063",
+]
+MAX_SCHEMES = int(os.environ.get("FUNDLENS_MAX_SCHEMES", "1200"))
+SLEEP = float(os.environ.get("FUNDLENS_SLEEP", "0.2"))
 TIMEOUT = 25
 RETRIES = 2
 
@@ -278,13 +286,24 @@ def run_scrape(year=None, month=None):
         exited = sum(1 for a in actions.values() if a == "exit")
         holding = sum(1 for a in actions.values() if a == "hold")
         total = len(actions)
-        # stock-level signal
-        if exited >= 2 and exited >= bought:        signal = "exit"
-        elif bought >= 2 and bought > sold + exited: signal = "buy"
-        elif sold + exited >= 2 and sold + exited > bought: signal = "sell"
-        elif bought > 0 and bought >= sold:          signal = "buy"
-        elif sold > 0:                               signal = "sell"
-        else:                                        signal = "hold"
+        movers = bought + sold + exited
+        net = bought - sold - exited        # positive = net accumulation
+        # conviction = net direction strength among AMCs that actually moved
+        # Signal rules (need at least 1 mover; ties -> hold):
+        if movers == 0:
+            signal = "hold"
+        elif exited >= 3 and exited >= bought:
+            signal = "exit"
+        elif net >= 2 and bought >= sold + exited:
+            signal = "buy"
+        elif net <= -2 and (sold + exited) > bought:
+            signal = "sell"
+        elif net > 0:
+            signal = "buy"
+        elif net < 0:
+            signal = "sell"
+        else:
+            signal = "hold"
         isin = "NAME:" + key.upper()
         stock_rows.append({"isin": isin, "name": s["name"], "sector": s["sector"],
                            "signal": signal, "total_amcs": total, "bought": bought,
