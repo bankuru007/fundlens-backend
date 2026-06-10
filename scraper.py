@@ -1,580 +1,323 @@
 """
-FundLens Scraper — Dynamic + Diagnostic (self-contained, no database)
-=====================================================================
-Fully dynamic: auto-discovers families, auto-finds latest data month.
-Full diagnostics: tells you exactly WHY if data is 0.
+FundLens Scraper v4 — FinAPI (finapi.upvaly.com)
+=================================================
+Data source: https://finapi.upvaly.com/api/mf/scheme-code/{schemeCode}
+Strategy:
+  1. Discover scheme codes (probe list endpoints, else crawl via morefundsfromamc)
+  2. Fetch holdings for each equity scheme
+  3. Map scheme -> AMC, aggregate holdings per stock per AMC
+  4. Snapshot to amc_holdings_raw, compare vs previous month -> signals
+  5. Upsert stock_intelligence / amc_holdings / scrape_meta in Supabase
 
-run_scrape() RETURNS the aggregated data (real data only, no fabrication).
-The previous month is fetched live too, so buy/sell/new/exit signals are
-computed entirely from authentic mfdata.in holdings — no DB required.
+Diagnostics print the raw structure of the first holding so field-name
+mismatches are visible immediately in the GitHub Actions log.
 """
 
-import json, time, logging, urllib.request, urllib.error
-from datetime import date, datetime
+import os, sys, json, time, logging, re
+from datetime import datetime, timezone
 from collections import defaultdict
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-logger = logging.getLogger(__name__)
+import requests
+from supabase import create_client
 
-API = "https://mfdata.in/api/v1"
-# Real browser User-Agent — generic UAs get 403'd by Cloudflare bot protection.
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                  '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.9',
+# ---------------------------------------------------------------- config
+BASE = "https://finapi.upvaly.com"
+SEED_CODES = ["120503", "152135"]           # confirmed working by user
+MAX_SCHEMES = 800                            # safety cap
+SLEEP = 0.25                                 # politeness delay (seconds)
+TIMEOUT = 25
+RETRIES = 2
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("fundlens")
+
+ERRORS, NOTES = [], []
+def err(msg):  ERRORS.append(msg); log.error("✗ " + msg)
+def note(msg): NOTES.append(msg);  log.info("→ " + msg)
+
+# 44 AMC keyword map (schemeName prefix -> canonical AMC name)
+AMC_KEYWORDS = {
+    "axis":"Axis MF","hdfc":"HDFC MF","icici":"ICICI Prudential MF","sbi":"SBI MF",
+    "kotak":"Kotak MF","nippon":"Nippon India MF","aditya":"Aditya Birla SL MF",
+    "birla":"Aditya Birla SL MF","uti":"UTI MF","dsp":"DSP MF","tata":"Tata MF",
+    "mirae":"Mirae Asset MF","invesco":"Invesco MF","franklin":"Franklin Templeton MF",
+    "motilal":"Motilal Oswal MF","canara":"Canara Robeco MF","edelweiss":"Edelweiss MF",
+    "lic":"LIC MF","sundaram":"Sundaram MF","quant ":"Quant MF","quantum":"Quantum MF",
+    "ppfas":"PPFAS MF","parag":"PPFAS MF","bandhan":"Bandhan MF","idfc":"Bandhan MF",
+    "hsbc":"HSBC MF","baroda":"Baroda BNP Paribas MF","bnp":"Baroda BNP Paribas MF",
+    "union":"Union MF","mahindra":"Mahindra Manulife MF","pgim":"PGIM India MF",
+    "jm ":"JM Financial MF","iti ":"ITI MF","navi":"Navi MF","whiteoak":"WhiteOak MF",
+    "white oak":"WhiteOak MF","samco":"Samco MF","trust":"Trust MF","nj ":"NJ MF",
+    "shriram":"Shriram MF","bajaj":"Bajaj Finserv MF","helios":"Helios MF",
+    "zerodha":"Zerodha MF","groww":"Groww MF","360":"360 ONE MF","bank of india":"Bank of India MF",
+    "boi":"Bank of India MF","taurus":"Taurus MF","old bridge":"Old Bridge MF",
 }
 
-# ============================================================
-# DIAGNOSTIC TRACKER
-# Tracks every step so we know exactly what happened
-# ============================================================
-class Diagnostic:
-    def __init__(self):
-        self.steps = []
-        self.errors = []
-        self.warnings = []
+EQUITY_HINTS = ("equity","elss","flexi","large","mid","small","multi","value",
+                "focused","contra","dividend yield","sectoral","thematic","index")
+DEBT_HINTS = ("debt","liquid","overnight","gilt","money market","bond","credit",
+              "duration","treasury","banking & psu","floater","fmp","arbitrage")
 
-    def ok(self, msg):
-        self.steps.append(f"✓ {msg}")
-        logger.info(f"✓ {msg}")
-
-    def fail(self, msg):
-        self.errors.append(f"✗ {msg}")
-        logger.error(f"✗ {msg}")
-
-    def warn(self, msg):
-        self.warnings.append(f"⚠ {msg}")
-        logger.warning(f"⚠ {msg}")
-
-    def info(self, msg):
-        self.steps.append(f"→ {msg}")
-        logger.info(f"→ {msg}")
-
-    def summary(self):
-        lines = ["", "=" * 60, "DIAGNOSTIC SUMMARY", "=" * 60]
-        lines += self.steps
-        if self.warnings:
-            lines += ["", "WARNINGS:"] + self.warnings
-        if self.errors:
-            lines += ["", "ERRORS:"] + self.errors
-        lines.append("=" * 60)
-        return "\n".join(lines)
-
-    def why_zero(self):
-        """Explain exactly why stocks = 0"""
-        reasons = []
-        for e in self.errors:
-            reasons.append(e)
-        for w in self.warnings:
-            reasons.append(w)
-        if not reasons:
-            reasons.append("⚠ Unknown reason — check logs above")
-        return reasons
-
-diag = Diagnostic()
-
-# ============================================================
-# HTTP HELPER
-# ============================================================
-def api_get(path, retries=3):
-    url = API + path
-    for attempt in range(retries):
+# ---------------------------------------------------------------- http
+def get(url, params=None):
+    for attempt in range(RETRIES + 1):
         try:
-            req = urllib.request.Request(url, headers=HEADERS)
-            r = urllib.request.urlopen(req, timeout=20)
-            raw = r.read()
-            data = json.loads(raw)
-            if data.get('status') == 'success':
-                return data.get('data', []), None
-            else:
-                err = data.get('message', 'API returned non-success status')
-                return [], err
-        except urllib.error.HTTPError as e:
-            err = f"HTTP {e.code}: {e.reason} for {url}"
-            if attempt == retries - 1:
-                return [], err
-            time.sleep(2 ** attempt)
-        except urllib.error.URLError as e:
-            err = f"Network error: {e.reason} for {url}"
-            if attempt == retries - 1:
-                return [], err
-            time.sleep(2 ** attempt)
-        except json.JSONDecodeError as e:
-            return [], f"Invalid JSON response from {url}: {e}"
+            r = requests.get(url, params=params, timeout=TIMEOUT,
+                             headers={"User-Agent":"FundLens/1.0"})
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 404:
+                return None
+            log.warning(f"HTTP {r.status_code} {url} (attempt {attempt+1})")
         except Exception as e:
-            if attempt == retries - 1:
-                return [], str(e)
-            time.sleep(2 ** attempt)
-    return [], "Max retries exceeded"
-
-def raw_get(path):
-    """Return the raw decoded JSON for a path (for debugging the live source)."""
-    url = API + path
-    try:
-        req = urllib.request.Request(url, headers=HEADERS)
-        r = urllib.request.urlopen(req, timeout=20)
-        return {"ok": True, "http": r.status, "json": json.loads(r.read())}
-    except urllib.error.HTTPError as e:
-        body = ""
-        try:
-            body = e.read().decode("utf-8", "ignore")[:500]
-        except Exception:
-            pass
-        return {"ok": False, "http": e.code, "reason": e.reason, "body": body}
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-
-def debug_probe(family_id=87, month=None):
-    """
-    Hit the live source and report exactly what comes back, plus how our parser
-    interprets it. Lets us confirm field names against reality from any network.
-    """
-    fam = raw_get("/families?limit=2")
-    mpath = f"/families/{family_id}/holdings" + (f"?month={month}" if month else "")
-    hold = raw_get(mpath)
-    parsed = []
-    if hold.get("ok"):
-        data = hold["json"].get("data", hold["json"]) if isinstance(hold["json"], dict) else hold["json"]
-        items = _extract_holdings(data)
-        for h in items[:3]:
-            if isinstance(h, dict):
-                parsed.append({"keys": list(h.keys()), "name_seen":
-                               (h.get('stock_name') or h.get('name') or h.get('company')),
-                               "amount_seen": _holding_amount(h)})
-    return {
-        "api_base": API,
-        "families_endpoint": fam,
-        "holdings_endpoint": {"path": mpath, **hold},
-        "parser_sees": {"holdings_count": len(_extract_holdings(
-            (hold.get("json", {}).get("data", hold.get("json", {})) if hold.get("ok") else {})
-        )), "first_items": parsed},
-    }
-
-# ============================================================
-# STEP 1: VERIFY API IS REACHABLE
-# ============================================================
-def verify_api():
-    diag.info("Testing mfdata.in API connectivity...")
-    data, err = api_get("/families?limit=1")
-    if err:
-        diag.fail(f"mfdata.in API unreachable: {err}")
-        diag.fail("Possible causes: API down, network issue, rate limited")
-        return False
-    if not data:
-        diag.fail("mfdata.in API reachable but returned empty data")
-        return False
-    diag.ok(f"mfdata.in API is reachable")
-    return True
-
-# ============================================================
-# STEP 2: AUTO-DISCOVER LATEST DATA MONTH
-# ============================================================
-def find_latest_month():
-    """
-    Test a known family to find which months have data.
-    Tries from current month going back 18 months.
-    """
-    diag.info("Auto-discovering latest available data month...")
-
-    # Use family 87 (ABSL Large Cap) as probe — stable, always exists
-    probe_family = 87
-
-    today = date.today()
-    months_tried = []
-
-    for i in range(18):
-        m = today.month - i
-        y = today.year
-        while m <= 0:
-            m += 12; y -= 1
-        month_str = f"{y}-{m:02d}"
-        months_tried.append(month_str)
-
-        data, err = api_get(f"/families/{probe_family}/holdings?month={month_str}")
-
-        if err:
-            diag.warn(f"  {month_str}: error — {err}")
-            time.sleep(0.3)
-            continue
-
-        holdings = _extract_holdings(data)
-        if holdings:
-            diag.ok(f"Latest available month: {month_str} ({len(holdings)} holdings in probe fund)")
-            return month_str
-
-        diag.info(f"  {month_str}: no data")
-        time.sleep(0.3)
-
-    diag.fail(f"No data found in last 18 months. Tried: {', '.join(months_tried[:6])}...")
-    diag.fail("mfdata.in may not have portfolio holdings data currently")
+            log.warning(f"{type(e).__name__} {url} (attempt {attempt+1})")
+        time.sleep(1 + attempt)
     return None
 
-# ============================================================
-# STEP 3: AUTO-DISCOVER EQUITY FAMILIES
-# ============================================================
-def get_equity_families():
-    diag.info("Fetching all fund families from mfdata.in...")
-    data, err = api_get("/families?limit=2000")
+def unwrap(payload):
+    """FinAPI wraps responses in {status,statusCode,message,data}."""
+    if isinstance(payload, dict) and "data" in payload:
+        return payload["data"]
+    return payload
 
-    if err:
-        diag.fail(f"Could not fetch families: {err}")
-        return []
-
-    if not data:
-        diag.fail("Families endpoint returned empty list")
-        diag.fail("Try: curl https://mfdata.in/api/v1/families?limit=5 to check manually")
-        return []
-
-    # Handle list or dict
-    if isinstance(data, dict):
-        data = data.get('families', data.get('items', data.get('data', [])))
-
-    diag.ok(f"Total families from API: {len(data)}")
-
-    # Filter equity funds dynamically
-    equity_keywords = [
-        'flexi cap', 'large cap', 'mid cap', 'small cap', 'multi cap',
-        'large & mid', 'focused', 'value fund', 'contra', 'dividend yield',
-        'bluechip', 'opportunities', 'equity', 'elss', 'tax saver',
-        'multicap', 'largecap', 'midcap', 'smallcap',
-    ]
-    debt_keywords = [
-        'liquid', 'overnight', 'debt', 'bond', 'gilt', 'money market',
-        'credit risk', 'banking and psu', 'corporate bond', 'duration',
-        'fixed maturity', 'arbitrage', 'fmp',
-    ]
-
-    equity = []
-    skipped_debt = 0
-    skipped_no_id = 0
-
-    for f in data:
-        fid = f.get('id') or f.get('family_id')
-        if not fid:
-            skipped_no_id += 1
-            continue
-
-        name = (f.get('name', '') or '').lower()
-        cat = (f.get('category', '') or '').lower()
-        stype = (f.get('scheme_type', '') or '').lower()
-
-        combined = f"{name} {cat} {stype}"
-
-        # Skip obvious debt funds
-        if any(kw in combined for kw in debt_keywords):
-            skipped_debt += 1
-            continue
-
-        # Include if equity-related
-        if any(kw in combined for kw in equity_keywords):
-            equity.append({
-                'id': fid,
-                'name': f.get('name', ''),
-                'amc': f.get('amc', '') or f.get('amc_name', ''),
-            })
-
-    diag.ok(f"Equity families found: {len(equity)}")
-    diag.info(f"Skipped: {skipped_debt} debt funds, {skipped_no_id} without ID")
-
-    if len(equity) == 0:
-        diag.fail("Zero equity families found after filtering")
-        diag.fail(f"Sample of raw family data: {json.dumps(data[:2], indent=2)[:500]}")
-        diag.warn("The API response format may have changed — check field names")
-
-    return equity
-
-# ============================================================
-# STEP 4: FETCH HOLDINGS PER FAMILY
-# ============================================================
-def extract_amc(family_name, amc_field=''):
-    if amc_field:
-        amc = amc_field.strip()
-        for s in [' Mutual Fund',' Asset Management',' AMC Limited',' AMC Ltd',' AMC']:
-            amc = amc.replace(s, '')
-        return amc.strip() or family_name.split()[0]
-
-    rules = [
-        ('SBI ','SBI MF'),('HDFC ','HDFC AMC'),('ICICI Prudential','ICICI Pru AMC'),
-        ('Axis ','Axis MF'),('Kotak ','Kotak MF'),('Nippon India','Nippon India MF'),
-        ('Mirae Asset','Mirae Asset MF'),('DSP ','DSP MF'),
-        ('Aditya Birla Sun Life','Aditya Birla Sun Life MF'),('ABSL ','Aditya Birla Sun Life MF'),
-        ('UTI ','UTI AMC'),('Franklin Templeton','Franklin Templeton MF'),
-        ('PGIM India','PGIM India MF'),('Invesco India','Invesco India MF'),
-        ('Tata ','Tata MF'),('Canara Robeco','Canara Robeco MF'),
-        ('Bandhan ','Bandhan MF'),('IDFC First','IDFC FIRST MF'),
-        ('Sundaram ','Sundaram MF'),('LIC ','LIC MF'),
-        ('Motilal Oswal','Motilal Oswal MF'),('PPFAS','PPFAS MF'),
-        ('Quant ','Quant MF'),('WhiteOak','WhiteOak Capital MF'),
-        ('Edelweiss ','Edelweiss MF'),('Groww ','Groww MF'),
-        ('Bajaj Finserv','Bajaj Finserv MF'),('360 ONE','360 ONE MF'),
-        ('HSBC ','HSBC MF'),('Navi ','Navi MF'),('Zerodha ','Zerodha MF'),
-        ('Shriram ','Shriram MF'),('Bank of India','Bank of India MF'),
-        ('Baroda BNP','Baroda BNP Paribas MF'),('Union ','Union MF'),
-        ('Mahindra Manulife','Mahindra Manulife MF'),
-    ]
-    for prefix, amc in rules:
-        if family_name.startswith(prefix) or prefix in family_name:
-            return amc
-    parts = family_name.split()
-    return ' '.join(parts[:2]) + ' MF' if len(parts) >= 2 else family_name
-
-def _to_float(v):
-    try:
-        return float(str(v).replace(',', '').replace('%', '').strip())
-    except (TypeError, ValueError):
-        return 0.0
-
-def _extract_holdings(data):
-    """Pull the equity-holdings list out of whatever envelope the API used."""
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for key in ('equity_holdings', 'equity', 'holdings', 'stocks', 'data', 'portfolio'):
-            v = data.get(key)
-            if isinstance(v, list):
+# ---------------------------------------------------------------- field detection
+def pick(d, *candidates, contains=None):
+    """Return first matching key's value from dict d (case-insensitive)."""
+    if not isinstance(d, dict):
+        return None
+    lower = {k.lower(): v for k, v in d.items()}
+    for c in candidates:
+        if c.lower() in lower:
+            return lower[c.lower()]
+    if contains:
+        for k, v in lower.items():
+            if contains in k:
                 return v
-        # data might itself be a dict keyed by isin -> holding
-        vals = list(data.values())
-        if vals and all(isinstance(x, dict) for x in vals):
-            return vals
-    return []
+    return None
 
-def _holding_amount(h):
-    """Position size: prefer real quantity/value, fall back to weight/allocation %."""
-    for k in ('quantity', 'units', 'shares', 'market_value', 'value', 'amount',
-              'weight_pct', 'weightage', 'weight', 'percentage', 'percent',
-              'allocation', 'corpus_pct', 'holding_pct', 'pct'):
-        amt = _to_float(h.get(k))
-        if amt > 0:
-            return amt
-    return 0.0
+def to_float(x):
+    if x is None: return None
+    try:
+        return float(str(x).replace(",", "").replace("%", "").strip())
+    except ValueError:
+        return None
 
-def fetch_family_holdings(fid, fname, amc, data_month):
-    data, err = api_get(f"/families/{fid}/holdings?month={data_month}")
-    if err:
-        # Retry without the month param — some deployments only serve "latest"
-        data, err = api_get(f"/families/{fid}/holdings")
-        if err:
-            return [], err
+def amc_from_scheme(name):
+    n = (name or "").lower()
+    for kw, amc in AMC_KEYWORDS.items():
+        if n.startswith(kw) or f" {kw}" in n[:30]:
+            return amc
+    return None
 
-    holdings = _extract_holdings(data)
+def looks_equity(category, name):
+    blob = f"{category or ''} {name or ''}".lower()
+    if any(h in blob for h in DEBT_HINTS):   return False
+    if any(h in blob for h in EQUITY_HINTS): return True
+    return None  # unknown -> decide by holdings content
 
-    results = []
-    for h in holdings:
-        if not isinstance(h, dict):
+# ---------------------------------------------------------------- discovery
+def discover_schemes():
+    """Try list endpoints first; fall back to crawling morefundsfromamc."""
+    note("Probing list endpoints...")
+    for path in ("/api/mf/schemes", "/api/mf/all", "/api/mf/list", "/api/mf"):
+        data = unwrap(get(BASE + path))
+        if isinstance(data, list) and len(data) > 50:
+            codes = []
+            for item in data:
+                c = pick(item, "schemeCode", "scheme_code", "code")
+                if c: codes.append(str(c))
+            if codes:
+                note(f"List endpoint {path} -> {len(codes)} schemes")
+                return codes[:MAX_SCHEMES]
+    note("No list endpoint. Crawling via morefundsfromamc from seeds...")
+    seen, queue, order = set(), list(SEED_CODES), []
+    while queue and len(seen) < MAX_SCHEMES:
+        code = queue.pop(0)
+        if code in seen: continue
+        seen.add(code); order.append(code)
+        data = unwrap(get(f"{BASE}/api/mf/scheme-code/{code}",
+                          params={"fields":"morefundsfromamc"}))
+        more = pick(data or {}, "morefundsfromamc", contains="morefunds") or []
+        if isinstance(more, dict): more = more.get("funds") or more.get("schemes") or []
+        for f in more if isinstance(more, list) else []:
+            c = pick(f, "schemeCode", "scheme_code", "code") if isinstance(f, dict) else f
+            if c and str(c) not in seen:
+                queue.append(str(c))
+        time.sleep(SLEEP)
+    note(f"Crawl discovered {len(order)} schemes")
+    return order
+
+# ---------------------------------------------------------------- holdings fetch
+def fetch_holdings(code, debug_first=[True]):
+    data = unwrap(get(f"{BASE}/api/mf/scheme-code/{code}",
+                      params={"fields":"holdings"}))
+    if not data: return None
+    name = pick(data, "schemeName", "scheme_name", "name") or ""
+    category = pick(data, "schemeCategory", "category") or ""
+    holdings = pick(data, "holdings", contains="holding") or []
+    if isinstance(holdings, dict):
+        holdings = holdings.get("holdings") or holdings.get("data") or []
+    if debug_first[0] and holdings:
+        debug_first[0] = False
+        note("RAW first holding structure: " + json.dumps(holdings[0])[:400])
+    rows = []
+    for h in holdings if isinstance(holdings, list) else []:
+        stock = pick(h, "companyName","company","name","stockName","security","instrument")
+        isin  = pick(h, "isin","isinCode","isin_code")
+        pct   = to_float(pick(h, "percentage","weight","pct","holdingPercent",
+                              "corpusPer","weightage", contains="per"))
+        qty   = to_float(pick(h, "quantity","qty","shares","noOfShares", contains="quant"))
+        sector= pick(h, "sector","industry","sectorName") or "Unknown"
+        if not stock: continue
+        if isin and not str(isin).upper().startswith(("INE","INF9","IN9")):
+            pass  # keep — some valid ISINs differ
+        rows.append({"stock":str(stock).strip(),"isin":(str(isin).strip().upper() if isin else None),
+                     "pct":pct,"qty":qty,"sector":str(sector).strip()})
+    return {"scheme":name,"category":category,"holdings":rows}
+
+# ---------------------------------------------------------------- main pipeline
+def run():
+    note("=== FundLens FinAPI Scraper v4 ===")
+    now = datetime.now(timezone.utc)
+    data_month = now.strftime("%Y-%m")
+    note(f"Run date {now.isoformat()}  data_month {data_month}")
+
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        err("SUPABASE_URL / SUPABASE_SERVICE_KEY env vars missing"); return finish(0, data_month)
+    sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+    # connectivity check
+    probe = unwrap(get(f"{BASE}/api/mf/scheme-code/{SEED_CODES[0]}",
+                       params={"fields":"holdings"}))
+    if not probe:
+        err(f"FinAPI unreachable from this runner ({BASE}). "
+            "Check if the host blocks GitHub IPs."); return finish(0, data_month)
+    note("FinAPI reachable ✓")
+
+    codes = discover_schemes()
+    if not codes:
+        err("No schemes discovered"); return finish(0, data_month)
+
+    # stock -> { isin, sector, amcs: {amc: weight} }
+    stocks = {}
+    amc_stock_pct = defaultdict(dict)     # (amc) -> {stock_key: pct}
+    schemes_done, skipped_nonequity, skipped_noamc = 0, 0, 0
+
+    for i, code in enumerate(codes):
+        res = fetch_holdings(code)
+        time.sleep(SLEEP)
+        if not res or not res["holdings"]:
             continue
-        isin = (h.get('isin') or h.get('stock_isin') or h.get('instrument_isin') or '').strip()
-        name = (h.get('stock_name') or h.get('name') or h.get('company')
-                or h.get('instrument_name') or h.get('security') or '').strip()
-        sector = (h.get('sector') or h.get('industry') or h.get('sector_name') or 'Other')
-        sector = (sector or 'Other').strip()
-        amt = _holding_amount(h)
+        eq = looks_equity(res["category"], res["scheme"])
+        ine_share = sum(1 for h in res["holdings"] if h["isin"] and h["isin"].startswith("INE"))
+        if eq is False or (eq is None and ine_share < max(3, len(res["holdings"])//4)):
+            skipped_nonequity += 1; continue
+        amc = amc_from_scheme(res["scheme"])
+        if not amc:
+            skipped_noamc += 1; continue
+        schemes_done += 1
+        for h in res["holdings"]:
+            key = h["isin"] or ("NAME:" + h["stock"].upper())
+            s = stocks.setdefault(key, {"name":h["stock"],"isin":h["isin"],
+                                        "sector":h["sector"],"amcs":set()})
+            if h["sector"] != "Unknown": s["sector"] = h["sector"]
+            s["amcs"].add(amc)
+            prev = amc_stock_pct[amc].get(key, 0.0)
+            amc_stock_pct[amc][key] = max(prev, h["pct"] or 0.0)
+        if (i+1) % 50 == 0:
+            note(f"...{i+1}/{len(codes)} schemes, {len(stocks)} stocks so far")
 
-        if name and amt > 0:
-            results.append({
-                'isin': isin or name,
-                'name': name,
-                'sector': sector or 'Other',
-                'amc': amc,
-                'quantity': amt,
-            })
+    note(f"Equity schemes processed {schemes_done} | non-equity skipped {skipped_nonequity} "
+         f"| unknown AMC skipped {skipped_noamc} | unique stocks {len(stocks)}")
+    if not stocks:
+        err("0 stocks parsed — check RAW structure log above for field names")
+        return finish(0, data_month)
 
-    return results, None
+    # ---------------- previous month snapshot from DB
+    prev = {}
+    try:
+        res = sb.table("amc_holdings_raw").select("isin,amc_name,quantity,data_month")\
+                .neq("data_month", data_month).order("data_month", desc=True).limit(50000).execute()
+        rows = res.data or []
+        prev_month = rows[0]["data_month"] if rows else None
+        for r in rows:
+            if r["data_month"] == prev_month:
+                prev[(r["isin"], r["amc_name"])] = r["quantity"] or 0
+        note(f"Previous snapshot: {prev_month} ({len(prev)} rows)" if prev_month
+             else "No previous snapshot — first run baseline")
+    except Exception as e:
+        err(f"Reading previous snapshot failed: {e}")
 
-# ============================================================
-# STEP 5: AGGREGATE
-# ============================================================
-def compute_signal(b,s,n,e,t):
-    if n>=3: return 'new'
-    if e>=2 and s>b: return 'exit'
-    if b>s*1.5 and b>=3: return 'buy'
-    if s>b*1.5 and s>=3: return 'sell'
-    return 'hold'
+    # ---------------- build rows
+    raw_rows, amc_rows, intel_rows = [], [], []
+    for key, s in stocks.items():
+        isin = s["isin"] or key
+        bought=sold=new_entry=exited=holding=0
+        for amc in s["amcs"]:
+            cur = int(round((amc_stock_pct[amc].get(key) or 0)*100))  # pct*100 as int qty proxy
+            p = prev.get((isin, amc))
+            if p is None and prev:        action,new_entry = "new_entry",new_entry+1
+            elif p is None:               action,holding   = "hold",holding+1
+            elif cur > p*1.05:            action,bought    = "buy",bought+1
+            elif cur < p*0.95:            action,sold      = "sell",sold+1
+            else:                         action,holding   = "hold",holding+1
+            raw_rows.append({"isin":isin,"amc_name":amc,"quantity":cur,"data_month":data_month})
+            amc_rows.append({"isin":isin,"amc_name":amc,"action":action,
+                             "curr_qty":cur,"prev_qty":p or 0,
+                             "change_pct":round(((cur-(p or 0))/p*100),2) if p else None})
+        # exits: AMCs present last month, absent now
+        for (pisin, pamc), pq in prev.items():
+            if pisin == isin and pamc not in s["amcs"]:
+                exited += 1
+                amc_rows.append({"isin":isin,"amc_name":pamc,"action":"exit",
+                                 "curr_qty":0,"prev_qty":pq,"change_pct":-100.0})
+        total = len(s["amcs"])
+        if   exited >= 3 and exited > bought:        signal="exit"
+        elif new_entry >= 3 and new_entry >= bought: signal="new"
+        elif bought > sold*1.5 and bought >= 3:      signal="buy"
+        elif sold > bought*1.5 and sold >= 3:        signal="sell"
+        else:                                        signal="hold"
+        intel_rows.append({"isin":isin,"name":s["name"],"sector":s["sector"],
+                           "signal":signal,"total_amcs":total,"bought":bought,"sold":sold,
+                           "holding":holding,"new_entry":new_entry,"exited":exited,
+                           "data_month":data_month})
 
-def get_prev_month(dm):
-    y,m=int(dm[:4]),int(dm[5:])
-    m-=1
-    if m==0: m,y=12,y-1
-    return f"{y}-{m:02d}"
+    # ---------------- upserts
+    def chunked(rows, table, conflict):
+        for j in range(0, len(rows), 500):
+            sb.table(table).upsert(rows[j:j+500], on_conflict=conflict).execute()
+    try:
+        chunked(intel_rows, "stock_intelligence", "isin")
+        chunked(raw_rows,   "amc_holdings_raw",   "isin,amc_name,data_month")
+        chunked(amc_rows,   "amc_holdings",       "isin,amc_name")
+        note(f"Upserted: {len(intel_rows)} stocks, {len(amc_rows)} AMC rows, {len(raw_rows)} raw rows")
+    except Exception as e:
+        err(f"Supabase upsert failed: {e}")
+        return finish(0, data_month)
+    return finish(len(intel_rows), data_month, sb)
 
-def aggregate(curr, prev, meta, dm):
-    stock_rows, amc_rows, raw_rows = [], [], []
-    for isin in set(list(curr.keys())+list(prev.keys())):
-        c=curr.get(isin,{}); p=prev.get(isin,{})
-        if not c: continue
-        all_amcs=set(list(c.keys())+list(p.keys()))
-        bought=sold=holding=new_entry=exited=0
-        details=[]
-        for amc in all_amcs:
-            cq=c.get(amc,0); pq=p.get(amc,0)
-            if cq>0 and pq==0:   action='new_entry'; new_entry+=1; bought+=1
-            elif cq==0 and pq>0: action='exit'; exited+=1; sold+=1
-            elif cq>pq*1.02:     action='buy'; bought+=1
-            elif cq<pq*0.98:     action='sell'; sold+=1
-            else:                action='hold'; holding+=1
-            chg=round(((cq-pq)/pq*100),1) if pq>0 else (100.0 if cq>0 else 0.0)
-            # Keep values as-is (rounded) — they may be share counts OR allocation %,
-            # so int() truncation would wrongly zero-out sub-1% weights.
-            cqr=round(cq,4); pqr=round(pq,4)
-            if cq>0 or pq>0:
-                details.append({'isin':isin,'amc_name':amc,'action':action,
-                    'curr_qty':cqr,'prev_qty':pqr,'change_pct':chg,'data_month':dm})
-            if cq>0:
-                raw_rows.append({'isin':isin,'company':meta.get(isin,{}).get('name',isin),
-                    'sector':meta.get(isin,{}).get('sector','Other'),
-                    'amc_name':amc,'quantity':cqr,'data_month':dm})
-        order={'new_entry':0,'buy':1,'hold':2,'sell':3,'exit':4}
-        details.sort(key=lambda x: order[x['action']])
-        total=len([a for a in details if a['action']!='exit'])
-        m=meta.get(isin,{'name':isin,'sector':'Other'})
-        stock_rows.append({'isin':isin,'name':m['name'],'sector':m['sector'],
-            'signal':compute_signal(bought,sold,new_entry,exited,total),
-            'total_amcs':total,'bought':bought,'sold':sold,'holding':holding,
-            'new_entry':new_entry,'exited':exited,
-            'data_month':dm,'updated_at':datetime.utcnow().isoformat()})
-        amc_rows.extend(details)
-    stock_rows.sort(key=lambda x: -x['total_amcs'])
-    return stock_rows, amc_rows, raw_rows
-
-def fetch_month(families, dm):
-    """Fetch holdings for every family for a given month. Returns (curr, meta, stats)."""
-    curr = defaultdict(lambda: defaultdict(float))
-    meta = {}
-    n_ok = n_empty = n_error = 0
-    sample_errors = []
-
-    for i, f in enumerate(families):
-        amc = extract_amc(f['name'], f.get('amc', ''))
-        holdings, err = fetch_family_holdings(f['id'], f['name'], amc, dm)
-
-        if err:
-            n_error += 1
-            if len(sample_errors) < 3:
-                sample_errors.append(f"{f['name'][:30]}: {err}")
-        elif len(holdings) == 0:
-            n_empty += 1
-        else:
-            n_ok += 1
-            for h in holdings:
-                curr[h['isin']][amc] += h['quantity']
-                if h['isin'] not in meta:
-                    meta[h['isin']] = {'name': h['name'], 'sector': h['sector']}
-
-        if (i + 1) % 20 == 0:
-            diag.info(f"  [{dm}] progress {i+1}/{len(families)} | {len(curr)} stocks so far")
-
-        time.sleep(0.4)
-
-    return curr, meta, {"ok": n_ok, "empty": n_empty, "error": n_error, "sample_errors": sample_errors}
-
-# ============================================================
-# MAIN — fetches real data and RETURNS it (no database)
-# ============================================================
-def run_scrape(year=None, month=None):
-    """
-    Fetch real MF holdings from mfdata.in and return aggregated intelligence.
-
-    Returns a dict:
-      {
-        "status": "ok" | "unavailable",
-        "stocks": [ ...stock_intelligence rows... ],
-        "amc_details": { isin: [ ...amc rows... ] },
-        "data_month": "YYYY-MM" | None,
-        "source": "mfdata.in",
-        "fetched_at": ISO timestamp,
-        "diagnostics": [ ...human-readable steps/errors... ],
-        "families_with_data": int,
-      }
-    No fabricated data is ever returned — on failure status is "unavailable".
-    """
-    global diag
-    diag = Diagnostic()
-
-    diag.info("=== FundLens Dynamic Scraper Started ===")
-    diag.info(f"Date: {datetime.utcnow().isoformat()}")
-
-    def fail(dm_val):
-        print(diag.summary())
-        return {
-            "status": "unavailable", "stocks": [], "amc_details": {},
-            "data_month": dm_val, "source": "mfdata.in",
-            "fetched_at": datetime.utcnow().isoformat(),
-            "diagnostics": diag.errors + diag.warnings, "families_with_data": 0,
-        }
-
-    # STEP 1: Verify API
-    if not verify_api():
-        return fail(None)
-
-    # STEP 2: Find latest data month (or use explicitly requested one)
-    if year and month:
-        dm = f"{year}-{month:02d}"
-        diag.info(f"Using requested month: {dm}")
-    else:
-        dm = find_latest_month()
-    if not dm:
-        return fail(None)
-
-    pm = get_prev_month(dm)
-    diag.info(f"Data month: {dm}, Previous month: {pm}")
-
-    # STEP 3: Get equity families
-    families = get_equity_families()
-    if not families:
-        return fail(dm)
-
-    # STEP 4: Fetch current month holdings (real data)
-    diag.info(f"Fetching CURRENT month holdings ({dm})...")
-    curr_d, meta, cstats = fetch_month(families, dm)
-    diag.info(f"Current month: {cstats['ok']} with data, {cstats['empty']} empty, {cstats['error']} errors")
-    if cstats["sample_errors"]:
-        diag.warn(f"Sample errors: {'; '.join(cstats['sample_errors'])}")
-
-    if len(curr_d) == 0:
-        diag.fail(f"ZERO stocks found for {dm} after fetching {len(families)} families")
-        if cstats["ok"] == 0 and cstats["error"] == 0:
-            diag.fail(f"All families returned empty for {dm} — month may not be published yet")
-        elif cstats["error"] > len(families) * 0.5:
-            diag.fail("Over 50% of families errored — API may be rate limiting or blocking")
-        return fail(dm)
-
-    diag.ok(f"Found {len(curr_d)} unique stocks across {cstats['ok']} fund families ({dm})")
-
-    # STEP 5: Fetch previous month holdings (real data) to compute buy/sell signals
-    diag.info(f"Fetching PREVIOUS month holdings ({pm}) for signal computation...")
-    prev_d, _, pstats = fetch_month(families, pm)
-    prev = {isin: dict(amcs) for isin, amcs in prev_d.items()}
-    if len(prev) == 0:
-        diag.warn(f"No previous-month ({pm}) data — signals will treat all positions as new/held")
-    else:
-        diag.ok(f"Previous month: {len(prev)} stocks ({pm}) for comparison")
-
-    # STEP 6: Aggregate
-    stock_rows, amc_rows, _raw = aggregate(
-        {isin: dict(amcs) for isin, amcs in curr_d.items()}, prev, meta, dm
-    )
-    diag.ok(f"Computed signals: {len(stock_rows)} stocks, {len(amc_rows)} AMC records")
-    print(diag.summary())
-
-    # Group amc rows by isin for fast detail lookup
-    amc_by_isin = defaultdict(list)
-    for r in amc_rows:
-        amc_by_isin[r["isin"]].append(r)
-
-    return {
-        "status": "ok",
-        "stocks": stock_rows,
-        "amc_details": dict(amc_by_isin),
-        "data_month": dm,
-        "source": "mfdata.in",
-        "fetched_at": datetime.utcnow().isoformat(),
-        "diagnostics": diag.steps + diag.warnings,
-        "families_with_data": cstats["ok"],
-    }
-
+def finish(count, data_month, sb=None):
+    summary = {"stocks":count}
+    if ERRORS: summary["error"] = ERRORS
+    if sb:
+        try:
+            sb.table("scrape_meta").insert({
+                "scraped_at":datetime.now(timezone.utc).isoformat(),
+                "data_month":data_month,"stocks_processed":count,
+                "notes":"finapi v4 | " + ("; ".join(ERRORS) if ERRORS else "ok")}).execute()
+        except Exception as e:
+            log.warning(f"scrape_meta insert failed: {e}")
+    print("\n" + "="*60 + "\nDIAGNOSTIC SUMMARY\n" + "="*60)
+    for n in NOTES:  print("→ " + n)
+    if ERRORS:
+        print("\nERRORS:")
+        for e in ERRORS: print("✗ " + e)
+    print("="*60)
+    print(("✅" if count and not ERRORS else "❌") + f" Result: {summary}")
+    return summary
 
 if __name__ == "__main__":
-    result = run_scrape()
-    print(f"\n{'✅' if result.get('status') == 'ok' else '❌'} "
-          f"Result: {len(result.get('stocks', []))} stocks, month={result.get('data_month')}")
+    run()
